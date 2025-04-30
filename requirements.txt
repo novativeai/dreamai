@@ -1,0 +1,13 @@
+# FastAPI framework and ASGI server
+uvicorn[standard]
+# Google Generative AI SDK
+google-generativeai
+# Required by FastAPI for handling form data (including file uploads)
+python-multipart
+pydantic
+fastapi==0.100.0
+hypercorn==0.14.4
+dotenv
+google
+# Although base64, os, mimetypes, uuid, and typing are imported,
+# they are part of the Python standard library and do not need to be listed here.
