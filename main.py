@@ -4,7 +4,7 @@ import uuid
 from typing import Optional
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
-from google import genai
+import google.generativeai as genai
 from google.genai import types
 
 app = FastAPI(title="Gemini Image Generation API")
