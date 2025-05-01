@@ -19,7 +19,7 @@ app = FastAPI(title="Gemini Image Generation API")
 # Then add this after creating your FastAPI app instance
 app.add_middleware(
     CORSMiddleware, # Your React app's URL
-    allow_origins=["https://vision-ai-tester.netlify.app","http://localhost:3000"],  # Your React app's URL
+    allow_origins=["http://localhost:3000"],  # Your React app's URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
