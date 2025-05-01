@@ -181,12 +181,3 @@ async def health_check():
     """Health check endpoint to verify the API is running"""
     return {"status": "healthy"}
 
-if __name__ == "__main__":
-    # Use uvicorn with recommended production settings
-    uvicorn.run(
-        "app:app", # Assuming your file is named app.py
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        workers=int(os.environ.get("WORKERS", 1)),
-        log_level="info"
-    )
