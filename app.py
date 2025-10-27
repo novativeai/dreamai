@@ -5,7 +5,8 @@ import os
 import mimetypes
 import uuid
 from typing import Optional, List, Any, Dict
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header, Response, JSONResponse, Query
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header, Response, Query
+from fastapi.responses import JSONResponse
 import uvicorn
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
