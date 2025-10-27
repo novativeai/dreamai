@@ -4,6 +4,7 @@ google-generativeai
 hypercorn
 python-dotenv
 paddle-sdk
+numpy
 firebase-admin
 python-multipart
 fal-client
