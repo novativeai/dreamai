@@ -2,8 +2,8 @@ import base64
 import os
 import mimetypes
 import uuid
-from typing import Optional  # Keep Optional for type hinting
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from typing import Optional
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 from google import genai
@@ -12,42 +12,62 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
 
-load_dotenv()  # This loads the variables from .env
+# --- PADDLE & FIREBASE INTEGRATION ---
+from paddle_sdk import Client, Environment
+from paddle_sdk.exceptions.request import PaddleException
+from paddle_sdk.webhooks.signature import Signature
+import firebase_admin
+from firebase_admin import credentials, firestore
+# --- END INTEGRATION IMPORTS ---
 
-app = FastAPI(title="Gemini Image Generation API")
 
-# Then add this after creating your FastAPI app instance
+load_dotenv()
+
+app = FastAPI(title="DreamAI API")
+
 app.add_middleware(
-    CORSMiddleware, # Your React app's URL
-    allow_origins=["https://dreamai-checkpoint.netlify.app", "http://localhost:8081","http://localhost:3000", "https://vision-ai-tester.netlify.app" ],  # Your React app's URL
+    CORSMiddleware,
+    allow_origins=["https://dreamai-checkpoint.netlify.app", "http://localhost:8081", "http://localhost:3000", "https://vision-ai-tester.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Directory to store uploaded and generated files
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
-
-# Create directories if they don't exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Check if API key is set
 if not os.environ.get("GEMINI_API_KEY"):
     raise ValueError("GEMINI_API_KEY environment variable must be set")
 
+# --- PADDLE & FIREBASE INITIALIZATION ---
+if not all(os.environ.get(key) for key in ["PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET", "FIREBASE_DATABASE_URL"]):
+    raise ValueError("PADDLE_API_KEY, PADDLE_WEBHOOK_SECRET, and FIREBASE_DATABASE_URL environment variables must be set")
+
+paddle = Client(
+    api_key=os.environ.get("PADDLE_API_KEY"),
+    environment=Environment.sandbox,
+)
+cred = credentials.Certificate("firebase-service-account.json")
+firebase_admin.initialize_app(cred, {
+    'databaseURL': os.environ.get("FIREBASE_DATABASE_URL")
+})
+db = firestore.client()
+# --- END INITIALIZATION ---
+
+
 def save_file(upload_file: UploadFile) -> str:
-    """Save an uploaded file to disk and return the path"""
     file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{upload_file.filename}")
     with open(file_path, "wb") as f:
         f.write(upload_file.file.read())
     return file_path
 
+
 @app.post("/generate/")
 async def generate_image(
     image1: UploadFile = File(...),
-    image2: Optional[UploadFile] = File(None),  # Change: Make image2 optional
+    image2: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
     temperature: float = Form(1.0),
     top_p: float = Form(0.95),
@@ -55,129 +75,193 @@ async def generate_image(
 ):
     """
     Generate an image using Gemini API based on one or two input images and a text prompt.
-
-    - **image1**: First input image (required)
-    - **image2**: Second input image (optional) # Change: Updated docstring
-    - **prompt**: Text description of what to generate
-    - **temperature**: Controls randomness (0.0-1.0)
-    - **top_p**: Nucleus sampling parameter (0.0-1.0)
-    - **top_k**: Top-k sampling parameter
     """
-    # Change: Initialize paths and file objects to None
     image1_path = None
     image2_path = None
     file1 = None
     file2 = None
-
     try:
-        # Initialize Gemini client
-        client = genai.Client(
-            api_key=os.environ.get("GEMINI_API_KEY"),
-        )
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         [os.remove(os.path.join(OUTPUT_DIR, f)) if os.path.isfile(os.path.join(OUTPUT_DIR, f)) else shutil.rmtree(os.path.join(OUTPUT_DIR, f)) for f in os.listdir(OUTPUT_DIR)]
-
-        # Save and upload image1 (always required)
         image1_path = save_file(image1)
         file1 = client.files.upload(file=image1_path)
-
-        # Change: Save and upload image2 only if provided
         if image2:
             image2_path = save_file(image2)
             file2 = client.files.upload(file=image2_path)
-
-        # Set up the model request
         model = "gemini-2.0-flash-exp-image-generation"
-
-        # Change: Dynamically build parts list
-        parts = [
-            types.Part.from_uri(
-                file_uri=file1.uri,
-                mime_type=file1.mime_type,
-            ),
-        ]
-        if file2: # Add image2 part if it exists
-            parts.append(
-                types.Part.from_uri(
-                    file_uri=file2.uri,
-                    mime_type=file2.mime_type,
-                )
-            )
-        parts.append(types.Part.from_text(text=prompt)) # Add text prompt last
-
+        parts = [types.Part.from_uri(file_uri=file1.uri, mime_type=file1.mime_type)]
+        if file2:
+            parts.append(types.Part.from_uri(file_uri=file2.uri, mime_type=file2.mime_type))
+        parts.append(types.Part.from_text(text=prompt))
         contents = [types.Content(role="user", parts=parts)]
-
-        generate_content_config = types.GenerateContentConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_output_tokens=8192,
-            response_modalities=["image", "text"],
-        )
-
-        # Generate content
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=generate_content_config,
-        )
-
-        # Process the response
+        generate_content_config = types.GenerateContentConfig(temperature=temperature, top_p=top_p, top_k=top_k, max_output_tokens=8192, response_modalities=["image", "text"])
+        response = client.models.generate_content(model=model, contents=contents, config=generate_content_config)
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
             raise HTTPException(status_code=500, detail="No content generated by the model")
-
-        # Handle image in response
         for part in response.candidates[0].content.parts:
             if hasattr(part, 'inline_data') and part.inline_data:
-                # Save the generated image
                 output_filename = f"generated_{uuid.uuid4()}"
                 file_extension = mimetypes.guess_extension(part.inline_data.mime_type) or ".png"
                 output_file_path = os.path.join(OUTPUT_DIR, f"{output_filename}{file_extension}")
-
-                with open(output_file_path, "wb") as f:
-                    f.write(part.inline_data.data)
-
-                # Change: Clean up temporary files conditionally
-                if image1_path and os.path.exists(image1_path):
-                    os.remove(image1_path)
-                if image2_path and os.path.exists(image2_path):
-                    os.remove(image2_path)
-
-                return FileResponse(
-                    path=output_file_path,
-                    media_type=part.inline_data.mime_type,
-                    filename=f"generated_image{file_extension}"
-                )
-
-        # Handle text-only response
+                with open(output_file_path, "wb") as f: f.write(part.inline_data.data)
+                if image1_path and os.path.exists(image1_path): os.remove(image1_path)
+                if image2_path and os.path.exists(image2_path): os.remove(image2_path)
+                return FileResponse(path=output_file_path, media_type=part.inline_data.mime_type, filename=f"generated_image{file_extension}")
         text_response = response.candidates[0].content.parts[0].text if hasattr(response.candidates[0].content.parts[0], 'text') else "No text response"
-
-        # Change: Clean up temporary files conditionally
-        if image1_path and os.path.exists(image1_path):
-            os.remove(image1_path)
-        if image2_path and os.path.exists(image2_path):
-            os.remove(image2_path)
-
+        if image1_path and os.path.exists(image1_path): os.remove(image1_path)
+        if image2_path and os.path.exists(image2_path): os.remove(image2_path)
         return {"message": "Generation completed", "text": text_response}
-
     except Exception as e:
-        # Change: Clean up any temporary files if they exist, conditionally
-        if image1_path and os.path.exists(image1_path):
-             os.remove(image1_path)
-        if image2_path and os.path.exists(image2_path):
-             os.remove(image2_path)
-
-        # It's good practice to log the actual error for debugging
-        print(f"Error during generation: {e}") # Optional: Log the error
+        if image1_path and os.path.exists(image1_path): os.remove(image1_path)
+        if image2_path and os.path.exists(image2_path): os.remove(image2_path)
+        print(f"Error during generation: {e}")
         import traceback
-        traceback.print_exc() # Optional: Print traceback for more details
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": f"An internal error occurred: {type(e).__name__}"})
 
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"An internal error occurred: {type(e).__name__}"}, # Avoid leaking too much detail
-        )
+
+@app.get("/products")
+async def get_products():
+    """Fetches all active products and their prices from Paddle."""
+    try:
+        product_response = paddle.products.list(params={'status': 'active', 'include': 'prices'})
+        products = list(product_response)
+        return {"data": products}
+    except PaddleException as e:
+        raise HTTPException(status_code=500, detail=f"Paddle API error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+
+@app.post("/create-checkout")
+async def create_checkout(request: Request):
+    """Creates a Paddle transaction and returns a checkout URL."""
+    body = await request.json()
+    price_id = body.get('priceId')
+    user_id = body.get('userId')
+
+    if not price_id or not user_id:
+        raise HTTPException(status_code=400, detail="priceId and userId are required")
+
+    try:
+        # Find if user already exists in Firestore to get paddle_customer_id
+        user_doc = db.collection('users').document(user_id).get()
+        paddle_customer_id = user_doc.to_dict().get('paddle_customer_id') if user_doc.exists else None
+
+        transaction_data = {
+            "items": [{"price_id": price_id, "quantity": 1}],
+            "customer_id": paddle_customer_id, # Pass existing customer ID or None to create a new one
+            "custom_data": { "firebase_uid": user_id, },
+            "success_url": "https://dreamai-checkpoint.netlify.app/payment-success",
+        }
+        transaction = paddle.transactions.create(transaction_data)
+        return {"checkout_url": transaction.checkout.url}
+    except PaddleException as e:
+        raise HTTPException(status_code=500, detail=f"Paddle API error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
+# NEW ENDPOINT
+@app.post("/create-customer-portal")
+async def create_customer_portal(request: Request):
+    """Generates a link to the Paddle Customer Portal for a user."""
+    body = await request.json()
+    user_id = body.get('userId')
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="userId is required")
+        
+    user_doc = db.collection('users').document(user_id).get()
+    if not user_doc.exists or not user_doc.to_dict().get('paddle_customer_id'):
+        raise HTTPException(status_code=404, detail="User has no subscription to manage.")
+
+    paddle_customer_id = user_doc.to_dict().get('paddle_customer_id')
+
+    try:
+        portal_link = paddle.customer_portal.create(paddle_customer_id)
+        return {"portal_url": portal_link.url}
+    except PaddleException as e:
+        raise HTTPException(status_code=500, detail=f"Paddle API error: {e}")
+
+
+# EXPANDED WEBHOOK HANDLER
+@app.post("/paddle-webhook")
+async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
+    """Handles all incoming webhooks from Paddle."""
+    if not paddle_signature:
+        raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
+
+    try:
+        request_body = await request.body()
+        webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
+        Signature.verify(request_body, paddle_signature, webhook_secret)
+        
+        event_data = await request.json()
+        event_type = event_data.get("event_type")
+        data = event_data.get("data")
+        
+        # --- Transaction Completed (Credits or Initial Subscription) ---
+        if event_type == "transaction.completed":
+            firebase_uid = data.get("custom_data", {}).get("firebase_uid")
+            if not firebase_uid: return JSONResponse(status_code=400, content={"error": "Missing firebase_uid"})
+            
+            user_ref = db.collection('users').document(firebase_uid)
+            
+            # Save Paddle Customer ID for future use (like creating the portal link)
+            paddle_customer_id = data.get("customer_id")
+            if paddle_customer_id:
+                user_ref.set({"paddle_customer_id": paddle_customer_id}, merge=True)
+
+            for item in data.get("items", []):
+                product_id = item.get("product", {}).get("id")
+                product_details = paddle.products.get(product_id)
+                product_type = product_details.custom_data.get("type")
+                
+                if product_type == "credits":
+                    credits_to_add = product_details.custom_data.get("credits", 0)
+                    user_ref.update({"credits": firestore.Increment(credits_to_add)})
+                    print(f"Added {credits_to_add} credits to user {firebase_uid}")
+                elif product_type == "subscription":
+                    user_ref.set({
+                        "premium_status": product_details.name,
+                        "subscription_id": data.get("subscription_id"),
+                        "subscription_status": "active"
+                    }, merge=True)
+                    print(f"ACTIVATED subscription for user {firebase_uid}")
+
+        # --- Subscription Canceled ---
+        elif event_type == "subscription.canceled":
+            # We need to find the user by their Paddle subscription or customer ID
+            # A more robust system would store a mapping of subscription_id -> firebase_uid
+            customer_id = data.get("customer_id")
+            users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
+            for user_doc in users_query:
+                user_ref = user_doc.reference
+                user_ref.update({"premium_status": None, "subscription_status": "canceled"})
+                print(f"CANCELED subscription for user {user_doc.id}")
+
+        # --- Subscription Updated (e.g., payment failed) ---
+        elif event_type == "subscription.updated" or event_type == "subscription.past_due":
+            customer_id = data.get("customer_id")
+            subscription_status = data.get("status") # e.g., 'active', 'past_due', 'canceled'
+            users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
+            for user_doc in users_query:
+                user_ref = user_doc.reference
+                if subscription_status != 'active':
+                    user_ref.update({"premium_status": None, "subscription_status": subscription_status})
+                    print(f"DEACTIVATED subscription for user {user_doc.id} due to status: {subscription_status}")
+                else:
+                    user_ref.update({"subscription_status": "active"}) # Reactivated
+        
+        return {"status": "received"}
+        
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid signature")
+    except Exception as e:
+        print(f"Error processing webhook: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint to verify the API is running"""
     return {"status": "healthy"}
-
