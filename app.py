@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import mimetypes
 import uuid
@@ -42,19 +43,35 @@ if not os.environ.get("GEMINI_API_KEY"):
     raise ValueError("GEMINI_API_KEY environment variable must be set")
 
 # --- PADDLE & FIREBASE INITIALIZATION ---
-if not all(os.environ.get(key) for key in ["PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET", "FIREBASE_DATABASE_URL"]):
-    raise ValueError("PADDLE_API_KEY, PADDLE_WEBHOOK_SECRET, and FIREBASE_DATABASE_URL environment variables must be set")
+if not all(os.environ.get(key) for key in ["PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET", "FIREBASE_DATABASE_URL", "FIREBASE_SERVICE_ACCOUNT_BASE64"]):
+    raise ValueError("PADDLE_API_KEY, PADDLE_WEBHOOK_SECRET, FIREBASE_DATABASE_URL, and FIREBASE_SERVICE_ACCOUNT_BASE64 environment variables must be set")
 
 paddle = Client(
     api_key=os.environ.get("PADDLE_API_KEY"),
     environment=Environment.sandbox,
 )
-cred = credentials.Certificate("firebase-service-account.json")
-firebase_admin.initialize_app(cred, {
-    'databaseURL': os.environ.get("FIREBASE_DATABASE_URL")
-})
-db = firestore.client()
-# --- END INITIALIZATION ---
+
+# --- MODIFIED FIREBASE INITIALIZATION BLOCK ---
+try:
+    # 1. Get the Base64 encoded string from the environment variable
+    firebase_sa_base64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64")
+    
+    # 2. Decode the Base64 string into bytes, then decode the bytes into a UTF-8 string
+    firebase_sa_decoded = base64.b64decode(firebase_sa_base64).decode('utf-8')
+    
+    # 3. Parse the JSON string into a Python dictionary
+    firebase_sa_dict = json.loads(firebase_sa_decoded)
+    
+    # 4. Initialize the Firebase Admin SDK with the credentials dictionary
+    cred = credentials.Certificate(firebase_sa_dict)
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': os.environ.get("FIREBASE_DATABASE_URL")
+    })
+    db = firestore.client()
+    print("Firebase Admin SDK initialized successfully from Base64 environment variable.")
+except (ValueError, TypeError, json.JSONDecodeError) as e:
+    raise ValueError(f"Error decoding or parsing Firebase service account from environment variable: {e}")
+# --- END MODIFIED BLOCK ---
 
 
 def save_file(upload_file: UploadFile) -> str:
@@ -73,9 +90,6 @@ async def generate_image(
     top_p: float = Form(0.95),
     top_k: int = Form(40),
 ):
-    """
-    Generate an image using Gemini API based on one or two input images and a text prompt.
-    """
     image1_path = None
     image2_path = None
     file1 = None
@@ -122,7 +136,6 @@ async def generate_image(
 
 @app.get("/products")
 async def get_products():
-    """Fetches all active products and their prices from Paddle."""
     try:
         product_response = paddle.products.list(params={'status': 'active', 'include': 'prices'})
         products = list(product_response)
@@ -135,22 +148,17 @@ async def get_products():
 
 @app.post("/create-checkout")
 async def create_checkout(request: Request):
-    """Creates a Paddle transaction and returns a checkout URL."""
     body = await request.json()
     price_id = body.get('priceId')
     user_id = body.get('userId')
-
     if not price_id or not user_id:
         raise HTTPException(status_code=400, detail="priceId and userId are required")
-
     try:
-        # Find if user already exists in Firestore to get paddle_customer_id
         user_doc = db.collection('users').document(user_id).get()
         paddle_customer_id = user_doc.to_dict().get('paddle_customer_id') if user_doc.exists else None
-
         transaction_data = {
             "items": [{"price_id": price_id, "quantity": 1}],
-            "customer_id": paddle_customer_id, # Pass existing customer ID or None to create a new one
+            "customer_id": paddle_customer_id,
             "custom_data": { "firebase_uid": user_id, },
             "success_url": "https://dreamai-checkpoint.netlify.app/payment-success",
         }
@@ -161,22 +169,17 @@ async def create_checkout(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
-# NEW ENDPOINT
+
 @app.post("/create-customer-portal")
 async def create_customer_portal(request: Request):
-    """Generates a link to the Paddle Customer Portal for a user."""
     body = await request.json()
     user_id = body.get('userId')
-
     if not user_id:
         raise HTTPException(status_code=400, detail="userId is required")
-        
     user_doc = db.collection('users').document(user_id).get()
     if not user_doc.exists or not user_doc.to_dict().get('paddle_customer_id'):
         raise HTTPException(status_code=404, detail="User has no subscription to manage.")
-
     paddle_customer_id = user_doc.to_dict().get('paddle_customer_id')
-
     try:
         portal_link = paddle.customer_portal.create(paddle_customer_id)
         return {"portal_url": portal_link.url}
@@ -184,39 +187,28 @@ async def create_customer_portal(request: Request):
         raise HTTPException(status_code=500, detail=f"Paddle API error: {e}")
 
 
-# EXPANDED WEBHOOK HANDLER
 @app.post("/paddle-webhook")
 async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
-    """Handles all incoming webhooks from Paddle."""
     if not paddle_signature:
         raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
-
     try:
         request_body = await request.body()
         webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
         Signature.verify(request_body, paddle_signature, webhook_secret)
-        
         event_data = await request.json()
         event_type = event_data.get("event_type")
         data = event_data.get("data")
-        
-        # --- Transaction Completed (Credits or Initial Subscription) ---
         if event_type == "transaction.completed":
             firebase_uid = data.get("custom_data", {}).get("firebase_uid")
             if not firebase_uid: return JSONResponse(status_code=400, content={"error": "Missing firebase_uid"})
-            
             user_ref = db.collection('users').document(firebase_uid)
-            
-            # Save Paddle Customer ID for future use (like creating the portal link)
             paddle_customer_id = data.get("customer_id")
             if paddle_customer_id:
                 user_ref.set({"paddle_customer_id": paddle_customer_id}, merge=True)
-
             for item in data.get("items", []):
                 product_id = item.get("product", {}).get("id")
                 product_details = paddle.products.get(product_id)
                 product_type = product_details.custom_data.get("type")
-                
                 if product_type == "credits":
                     credits_to_add = product_details.custom_data.get("credits", 0)
                     user_ref.update({"credits": firestore.Increment(credits_to_add)})
@@ -228,22 +220,16 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
                         "subscription_status": "active"
                     }, merge=True)
                     print(f"ACTIVATED subscription for user {firebase_uid}")
-
-        # --- Subscription Canceled ---
         elif event_type == "subscription.canceled":
-            # We need to find the user by their Paddle subscription or customer ID
-            # A more robust system would store a mapping of subscription_id -> firebase_uid
             customer_id = data.get("customer_id")
             users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
             for user_doc in users_query:
                 user_ref = user_doc.reference
                 user_ref.update({"premium_status": None, "subscription_status": "canceled"})
                 print(f"CANCELED subscription for user {user_doc.id}")
-
-        # --- Subscription Updated (e.g., payment failed) ---
         elif event_type == "subscription.updated" or event_type == "subscription.past_due":
             customer_id = data.get("customer_id")
-            subscription_status = data.get("status") # e.g., 'active', 'past_due', 'canceled'
+            subscription_status = data.get("status")
             users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
             for user_doc in users_query:
                 user_ref = user_doc.reference
@@ -251,10 +237,8 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
                     user_ref.update({"premium_status": None, "subscription_status": subscription_status})
                     print(f"DEACTIVATED subscription for user {user_doc.id} due to status: {subscription_status}")
                 else:
-                    user_ref.update({"subscription_status": "active"}) # Reactivated
-        
+                    user_ref.update({"subscription_status": "active"})
         return {"status": "received"}
-        
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid signature")
     except Exception as e:
