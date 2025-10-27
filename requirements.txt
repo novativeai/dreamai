@@ -3,8 +3,7 @@ uvicorn[standard]
 google-generativeai
 hypercorn
 python-dotenv
-paddle-sdk
-numpy
+paddle-python-sdk
 firebase-admin
 python-multipart
 fal-client
