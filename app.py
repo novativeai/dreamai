@@ -4,14 +4,14 @@ import os
 import mimetypes
 import uuid
 from typing import Optional
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header, Response
 import uvicorn
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
+
+# --- NEW FAL AI IMPORT ---
+import fal_client
 
 # --- PADDLE & FIREBASE INTEGRATION ---
 from paddle_sdk import Client, Environment
@@ -39,101 +39,106 @@ OUTPUT_DIR = "outputs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-if not os.environ.get("GEMINI_API_KEY"):
-    raise ValueError("GEMINI_API_KEY environment variable must be set")
+# Update the startup check to include the FAL_AI_KEY
+if not all(os.environ.get(key) for key in ["PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET", "FIREBASE_DATABASE_URL", "FIREBASE_SERVICE_ACCOUNT_BASE64", "FAL_AI_KEY"]):
+    raise ValueError("All required environment variables (Paddle, Firebase, Fal AI) must be set")
 
-# --- PADDLE & FIREBASE INITIALIZATION ---
-if not all(os.environ.get(key) for key in ["PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET", "FIREBASE_DATABASE_URL", "FIREBASE_SERVICE_ACCOUNT_BASE64"]):
-    raise ValueError("PADDLE_API_KEY, PADDLE_WEBHOOK_SECRET, FIREBASE_DATABASE_URL, and FIREBASE_SERVICE_ACCOUNT_BASE64 environment variables must be set")
+# Configure Fal AI client with the key
+fal_client.api_key = os.environ.get("FAL_AI_KEY")
 
+# --- PADDLE & FIREBASE INITIALIZATION (Unchanged) ---
 paddle = Client(
     api_key=os.environ.get("PADDLE_API_KEY"),
     environment=Environment.sandbox,
 )
-
-# --- MODIFIED FIREBASE INITIALIZATION BLOCK ---
 try:
-    # 1. Get the Base64 encoded string from the environment variable
     firebase_sa_base64 = os.environ.get("FIREBASE_SERVICE_ACCOUNT_BASE64")
-    
-    # 2. Decode the Base64 string into bytes, then decode the bytes into a UTF-8 string
     firebase_sa_decoded = base64.b64decode(firebase_sa_base64).decode('utf-8')
-    
-    # 3. Parse the JSON string into a Python dictionary
     firebase_sa_dict = json.loads(firebase_sa_decoded)
-    
-    # 4. Initialize the Firebase Admin SDK with the credentials dictionary
     cred = credentials.Certificate(firebase_sa_dict)
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': os.environ.get("FIREBASE_DATABASE_URL")
-    })
+    firebase_admin.initialize_app(cred, {'databaseURL': os.environ.get("FIREBASE_DATABASE_URL")})
     db = firestore.client()
     print("Firebase Admin SDK initialized successfully from Base64 environment variable.")
 except (ValueError, TypeError, json.JSONDecodeError) as e:
     raise ValueError(f"Error decoding or parsing Firebase service account from environment variable: {e}")
-# --- END MODIFIED BLOCK ---
+# --- END INITIALIZATION ---
 
 
-def save_file(upload_file: UploadFile) -> str:
-    file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{upload_file.filename}")
-    with open(file_path, "wb") as f:
-        f.write(upload_file.file.read())
-    return file_path
-
-
+# =================================================================================
+# === REFACTORED /generate/ ENDPOINT FOR FAL AI ===================================
+# =================================================================================
 @app.post("/generate/")
 async def generate_image(
     image1: UploadFile = File(...),
+    # The payload can still contain these, but we will ignore them
     image2: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
-    temperature: float = Form(1.0),
-    top_p: float = Form(0.95),
-    top_k: int = Form(40),
+    temperature: float = Form(1.0), # temperature is not a direct param for FLUX
+    top_p: float = Form(0.95),       # top_p is not a direct param for FLUX
+    top_k: int = Form(40),         # top_k is not a direct param for FLUX
 ):
-    image1_path = None
-    image2_path = None
-    file1 = None
-    file2 = None
+    """
+    Generate an image using Fal AI's FLUX model based on ONE input image and a prompt.
+    This endpoint maintains the original payload structure for frontend compatibility.
+    """
+    # Ensure an image was actually sent
+    if not image1 or not image1.file:
+        raise HTTPException(status_code=400, detail="An image file is required.")
+
     try:
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        [os.remove(os.path.join(OUTPUT_DIR, f)) if os.path.isfile(os.path.join(OUTPUT_DIR, f)) else shutil.rmtree(os.path.join(OUTPUT_DIR, f)) for f in os.listdir(OUTPUT_DIR)]
-        image1_path = save_file(image1)
-        file1 = client.files.upload(file=image1_path)
-        if image2:
-            image2_path = save_file(image2)
-            file2 = client.files.upload(file=image2_path)
-        model = "gemini-2.0-flash-exp-image-generation"
-        parts = [types.Part.from_uri(file_uri=file1.uri, mime_type=file1.mime_type)]
-        if file2:
-            parts.append(types.Part.from_uri(file_uri=file2.uri, mime_type=file2.mime_type))
-        parts.append(types.Part.from_text(text=prompt))
-        contents = [types.Content(role="user", parts=parts)]
-        generate_content_config = types.GenerateContentConfig(temperature=temperature, top_p=top_p, top_k=top_k, max_output_tokens=8192, response_modalities=["image", "text"])
-        response = client.models.generate_content(model=model, contents=contents, config=generate_content_config)
-        if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
-            raise HTTPException(status_code=500, detail="No content generated by the model")
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, 'inline_data') and part.inline_data:
-                output_filename = f"generated_{uuid.uuid4()}"
-                file_extension = mimetypes.guess_extension(part.inline_data.mime_type) or ".png"
-                output_file_path = os.path.join(OUTPUT_DIR, f"{output_filename}{file_extension}")
-                with open(output_file_path, "wb") as f: f.write(part.inline_data.data)
-                if image1_path and os.path.exists(image1_path): os.remove(image1_path)
-                if image2_path and os.path.exists(image2_path): os.remove(image2_path)
-                return FileResponse(path=output_file_path, media_type=part.inline_data.mime_type, filename=f"generated_image{file_extension}")
-        text_response = response.candidates[0].content.parts[0].text if hasattr(response.candidates[0].content.parts[0], 'text') else "No text response"
-        if image1_path and os.path.exists(image1_path): os.remove(image1_path)
-        if image2_path and os.path.exists(image2_path): os.remove(image2_path)
-        return {"message": "Generation completed", "text": text_response}
+        # Read the image bytes directly from the upload stream into memory.
+        # This is more efficient than saving to disk first.
+        image_bytes = await image1.read()
+        
+        # Ensure the file type is one Fal AI can handle
+        allowed_types = ["image/jpeg", "image/png", "image/webp"]
+        if image1.content_type not in allowed_types:
+            raise HTTPException(
+                status_code=415, 
+                detail=f"Unsupported image type: {image1.content_type}. Please use JPEG, PNG, or WebP."
+            )
+
+        # Call the Fal AI model using fal_client.run for a direct response
+        # We wrap the image bytes using fal_client's helper class
+        result = fal_client.run(
+            "fal-ai/flux-pro/kontext",
+            arguments={
+                "prompt": prompt,
+                "image": fal_client.Image.from_bytes(image_bytes, format=image1.content_type.split('/')[1]),
+                # Default values for FLUX can be set here
+                "guidance_scale": 3.5,
+                "num_images": 1,
+                "output_format": "jpeg", # The frontend expects an image
+            },
+        )
+
+        # Process the response from Fal AI
+        if not result or "images" not in result or len(result["images"]) == 0:
+            raise HTTPException(status_code=500, detail="No image was generated by the model.")
+        
+        # Extract the generated image data
+        generated_image = result["images"][0]
+        image_content_bytes = generated_image["content"]
+        image_media_type = generated_image["content_type"]
+
+        # Return the image bytes directly in the response body.
+        # FastAPI's Response object is used for in-memory content.
+        return Response(content=image_content_bytes, media_type=image_media_type)
+
+    except fal_client.FALServerException as e:
+        print(f"Fal AI Server Error: {e}")
+        raise HTTPException(status_code=503, detail=f"The image generation service failed: {e}")
     except Exception as e:
-        if image1_path and os.path.exists(image1_path): os.remove(image1_path)
-        if image2_path and os.path.exists(image2_path): os.remove(image2_path)
-        print(f"Error during generation: {e}")
+        print(f"An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": f"An internal error occurred: {type(e).__name__}"})
+        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+# =================================================================================
+# === END OF REFACTORED ENDPOINT ==================================================
+# =================================================================================
 
 
+# --- ALL OTHER ENDPOINTS (products, checkouts, webhooks, health) remain UNCHANGED ---
 @app.get("/products")
 async def get_products():
     try:
