@@ -21,7 +21,6 @@ try:
     from paddle_billing import Client, Environment, Options
     from paddle_billing.Exceptions.ApiError import ApiError
     from paddle_billing.Notifications import Verifier, Secret
-    from paddle_billing.Resources.Transactions.Operations import CreateTransaction, CreateTransactionItem
 except Exception as e:
     # Provide a clearer runtime error if paddle_billing is missing
     raise ImportError(
@@ -252,40 +251,34 @@ async def create_checkout(request: Request):
         user_doc = db.collection('users').document(user_id).get()
         paddle_customer_id = user_doc.to_dict().get('paddle_customer_id') if user_doc.exists else None
 
-        # Build transaction items using the SDK's operation objects
-        items = [
-            CreateTransactionItem(
-                price_id=price_id,
-                quantity=1,
-            )
-        ]
+        txn_payload = {
+            "items": [
+                { "price_id": price_id, "quantity": 1 }
+            ],
+            "customer_id": paddle_customer_id,
+            "custom_data": { "firebase_uid": user_id },
+            "success_url": "https://dreamai-checkpoint.netlify.app/payment-success",
+        }
 
-        # Construct CreateTransaction operation. Add custom_data to tie to firebase UID.
-        create_txn_op = CreateTransaction(
-            items=items,
-            customer_id=paddle_customer_id,
-            custom_data={"firebase_uid": user_id},
-            success_url="https://dreamai-checkpoint.netlify.app/payment-success",
-        )
+        transaction = paddle.transactions.create(txn_payload)
 
-        transaction = paddle.transactions.create(create_txn_op)
-
-        # Extract checkout URL - SDK shapes vary so be defensive
-        checkout_obj = getattr(transaction, "checkout", None)
+        # Extract checkout URL intelligently
         url = None
-        if checkout_obj:
-            url = getattr(checkout_obj, "url", None) or getattr(checkout_obj, "checkout_url", None) or checkout_obj
-        else:
+        if hasattr(transaction, "checkout"):
+            url = getattr(transaction.checkout, "url", None)
+        if not url:
             url = getattr(transaction, "checkout_url", None) or getattr(transaction, "url", None)
 
         if not url:
             raise HTTPException(status_code=500, detail="Failed to create checkout URL")
 
         return {"checkout_url": url}
+
     except ApiError as e:
         raise HTTPException(status_code=500, detail=f"Paddle API error: {getattr(e, 'message', str(e))}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+
 
 
 @app.post("/create-customer-portal")
