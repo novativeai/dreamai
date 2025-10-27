@@ -1,7 +1,7 @@
-fastapi==0.100.0
-uvicorn==0.34.2
-python-dotenv==1.1.0
-python-multipart==0.0.20
-google-genai==1.7.0
-hypercorn==0.14.4
-pydantic
+fastapi
+uvicorn[standard]
+google-generativeai
+python-dotenv
+paddle-sdk
+firebase-admin
+python-multipart
