@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 google-generativeai
+hypercorn
 python-dotenv
 paddle-sdk
 firebase-admin
