@@ -242,7 +242,7 @@ async def get_products(status: str = Query("active", description="Filter by prod
     """
     try:
         params = {"status": status, "include": "prices"}
-        product_iter = paddle.products.list(params=params)
+        product_iter = paddle.products.list(**params)
 
         serialized_products = []
         for p in product_iter:
