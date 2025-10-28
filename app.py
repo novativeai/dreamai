@@ -43,7 +43,10 @@ app.add_middleware(
         "https://dreamai-checkpoint.netlify.app",
         "http://localhost:8081",
         "http://localhost:3000",
+        "http://localhost:19006",  # Expo web default
         "https://vision-ai-tester.netlify.app",
+        "exp://localhost:8081",   # Expo native
+        "*"  # Allow all origins for development - restrict in production
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -63,17 +66,31 @@ required_envs = [
     "FIREBASE_SERVICE_ACCOUNT_BASE64",
     "FAL_AI_KEY",
 ]
+# Optional but recommended
+optional_envs = ["PADDLE_ENVIRONMENT"]  # Defaults to 'sandbox' if not set
+
 missing = [k for k in required_envs if not os.environ.get(k)]
 if missing:
     raise ValueError(f"All required environment variables must be set. Missing: {missing}")
+
+print("✓ All required environment variables loaded")
+if not os.environ.get("PADDLE_ENVIRONMENT"):
+    print("⚠ PADDLE_ENVIRONMENT not set, defaulting to 'sandbox'")
 
 # Configure Fal AI client with the key
 fal_client.api_key = os.environ.get("FAL_AI_KEY")
 
 # --- PADDLE CLIENT INIT ---
 PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY")
-# Use Options(Environment.SANDBOX) for sandbox, Options(Environment.PRODUCTION) for live
-paddle = Client(PADDLE_API_KEY, options=Options(Environment.SANDBOX))
+PADDLE_ENVIRONMENT = os.environ.get("PADDLE_ENVIRONMENT", "sandbox").lower()
+
+# Initialize Paddle client with appropriate environment
+if PADDLE_ENVIRONMENT == "production":
+    paddle = Client(PADDLE_API_KEY, options=Options(Environment.PRODUCTION))
+    print("✓ Paddle initialized in PRODUCTION mode")
+else:
+    paddle = Client(PADDLE_API_KEY, options=Options(Environment.SANDBOX))
+    print("✓ Paddle initialized in SANDBOX mode")
 
 
 # --- FIREBASE INIT FROM BASE64 ENV VAR (unchanged) ---
@@ -222,6 +239,7 @@ async def get_products(status: str = Query("active", description="Filter by prod
     """
     Fetch products from Paddle (includes prices). Returns JSON-serializable list.
     Uses SDK's products.list(...) which yields paginated results.
+    Enhanced for frontend compatibility with proper sorting and filtering.
     """
     try:
         params = {"status": status, "include": "prices"}
@@ -229,55 +247,117 @@ async def get_products(status: str = Query("active", description="Filter by prod
 
         serialized_products = []
         for p in product_iter:
-            serialized_products.append(serialize_product(p))
+            serialized = serialize_product(p)
+            # Ensure custom_data exists for frontend filtering
+            if not serialized.get("custom_data"):
+                serialized["custom_data"] = {}
+            serialized_products.append(serialized)
 
-        return {"data": serialized_products}
+        # Sort by custom_data.isRecommended for frontend display
+        serialized_products.sort(
+            key=lambda x: (
+                x.get("custom_data", {}).get("isRecommended") is not True,
+                x.get("name", "")
+            )
+        )
+
+        return {"success": True, "data": serialized_products}
 
     except ApiError as e:
         detail = getattr(e, "message", str(e))
+        print(f"Paddle API error in /products: {detail}")
         raise HTTPException(status_code=502, detail=f"Paddle API error: {detail}")
     except Exception as e:
+        print(f"Internal error in /products: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
 @app.post("/create-checkout")
 async def create_checkout(request: Request):
+    """
+    Create a Paddle checkout session for subscription or credit purchase.
+    Enhanced to handle email parameter and provide better error messages.
+    """
     body = await request.json()
     price_id = body.get('priceId')
     user_id = body.get('userId')
+    email = body.get('email')  # Optional: pre-fill customer email
+    
     if not price_id or not user_id:
-        raise HTTPException(status_code=400, detail="priceId and userId are required")
+        raise HTTPException(
+            status_code=400, 
+            detail="priceId and userId are required"
+        )
+    
     try:
+        # Get user document from Firebase
         user_doc = db.collection('users').document(user_id).get()
-        paddle_customer_id = user_doc.to_dict().get('paddle_customer_id') if user_doc.exists else None
+        user_data = user_doc.to_dict() if user_doc.exists else {}
+        paddle_customer_id = user_data.get('paddle_customer_id')
+        
+        # If no email provided, try to get from Firebase
+        if not email and user_data:
+            email = user_data.get('email')
 
+        # Build transaction payload
         txn_payload = {
             "items": [
-                { "price_id": price_id, "quantity": 1 }
+                {"price_id": price_id, "quantity": 1}
             ],
-            "customer_id": paddle_customer_id,
-            "custom_data": { "firebase_uid": user_id },
+            "custom_data": {"firebase_uid": user_id},
             "success_url": "https://dreamai-checkpoint.netlify.app/payment-success",
         }
+        
+        # Add customer_id if exists (for returning customers)
+        if paddle_customer_id:
+            txn_payload["customer_id"] = paddle_customer_id
+        
+        # Add email if available (for new customers)
+        if email and not paddle_customer_id:
+            txn_payload["customer_email"] = email
 
+        print(f"Creating checkout for user {user_id} with price {price_id}")
         transaction = paddle.transactions.create(txn_payload)
 
         # Extract checkout URL intelligently
         url = None
         if hasattr(transaction, "checkout"):
-            url = getattr(transaction.checkout, "url", None)
+            checkout_obj = transaction.checkout
+            if hasattr(checkout_obj, "url"):
+                url = checkout_obj.url
+        
         if not url:
             url = getattr(transaction, "checkout_url", None) or getattr(transaction, "url", None)
 
         if not url:
-            raise HTTPException(status_code=500, detail="Failed to create checkout URL")
+            print(f"Failed to extract checkout URL from transaction: {transaction}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Failed to create checkout URL. Please try again."
+            )
 
-        return {"checkout_url": url}
+        print(f"Successfully created checkout: {url}")
+        return {
+            "success": True,
+            "checkout_url": url,
+            "transaction_id": getattr(transaction, "id", None)
+        }
 
     except ApiError as e:
-        raise HTTPException(status_code=500, detail=f"Paddle API error: {getattr(e, 'message', str(e))}")
+        error_msg = getattr(e, 'message', str(e))
+        print(f"Paddle API error in /create-checkout: {error_msg}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Paddle API error: {error_msg}"
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+        print(f"Internal error in /create-checkout: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, 
+            detail=f"An internal error occurred: {str(e)}"
+        )
 
 
 
@@ -305,84 +385,269 @@ async def create_customer_portal(request: Request):
 
 @app.post("/paddle-webhook")
 async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
+    """
+    Handle Paddle webhook events.
+    CRITICAL: Must respond within 5 seconds to prevent retries.
+    Enhanced with better logging and error handling.
+    """
     if not paddle_signature:
+        print("ERROR: Missing Paddle-Signature header")
         raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
+    
     try:
+        # Get raw body for signature verification
         body_bytes = await request.body()
         webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
+        
         if not webhook_secret:
+            print("ERROR: PADDLE_WEBHOOK_SECRET not configured")
             raise HTTPException(status_code=500, detail="PADDLE_WEBHOOK_SECRET not configured")
 
+        # Verify webhook signature
         verifier = Verifier()
         secret = Secret(webhook_secret)
 
-        # The SDK's verifier tries to work with framework request objects. If compatibility issues appear
-        # you can pass a minimal object with `.body` and `.headers`. Here we attempt the simple approach first.
-        integrity_ok = verifier.verify(request, secret)
+        try:
+            integrity_ok = verifier.verify(request, secret)
+        except Exception as verify_error:
+            print(f"ERROR: Signature verification failed: {verify_error}")
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        
         if not integrity_ok:
+            print("ERROR: Webhook signature verification failed")
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
+        # Parse event data
         event_data = await request.json()
         event_type = event_data.get("event_type")
+        event_id = event_data.get("event_id")
         data = event_data.get("data")
 
+        print(f"✓ Received webhook: {event_type} (ID: {event_id})")
+
+        # Process different event types
         if event_type == "transaction.completed":
-            firebase_uid = data.get("custom_data", {}).get("firebase_uid")
-            if not firebase_uid:
-                return JSONResponse(status_code=400, content={"error": "Missing firebase_uid"})
-            user_ref = db.collection('users').document(firebase_uid)
-            paddle_customer_id = data.get("customer_id")
-            if paddle_customer_id:
-                user_ref.set({"paddle_customer_id": paddle_customer_id}, merge=True)
-            for item in data.get("items", []):
-                product_id = item.get("product", {}).get("id")
-                # Defensive product retrieval
-                try:
-                    product_details = paddle.products.get(product_id)
-                except Exception as e:
-                    print(f"Warning: unable to fetch product {product_id}: {e}")
-                    product_details = {}
-                product_type = (getattr(product_details, "custom_data", None) or {}).get("type") if product_details else None
+            await handle_transaction_completed(data)
+        
+        elif event_type == "subscription.created":
+            await handle_subscription_created(data)
+        
+        elif event_type == "subscription.updated":
+            await handle_subscription_updated(data)
+        
+        elif event_type == "subscription.canceled":
+            await handle_subscription_canceled(data)
+        
+        elif event_type == "subscription.past_due":
+            await handle_subscription_past_due(data)
+        
+        else:
+            print(f"INFO: Unhandled event type: {event_type}")
+
+        # IMPORTANT: Respond quickly (within 5 seconds)
+        return {"status": "received", "event_id": event_id}
+
+    except HTTPException:
+        raise
+    except ApiError as e:
+        error_msg = getattr(e, 'message', str(e))
+        print(f"ERROR: Paddle API error in webhook: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Paddle API error: {error_msg}")
+    except Exception as e:
+        print(f"ERROR: Unexpected error in webhook processing: {e}")
+        import traceback
+        traceback.print_exc()
+        # Still return 200 to prevent Paddle retries for non-signature errors
+        return {"status": "error", "message": "Internal processing error"}
+
+
+# --- Webhook Event Handlers ---
+
+async def handle_transaction_completed(data: dict):
+    """Handle transaction.completed event - provision access or credits"""
+    firebase_uid = data.get("custom_data", {}).get("firebase_uid")
+    
+    if not firebase_uid:
+        print("WARNING: transaction.completed missing firebase_uid")
+        return
+    
+    try:
+        user_ref = db.collection('users').document(firebase_uid)
+        paddle_customer_id = data.get("customer_id")
+        
+        # Update paddle_customer_id if available
+        if paddle_customer_id:
+            user_ref.set({"paddle_customer_id": paddle_customer_id}, merge=True)
+            print(f"✓ Updated paddle_customer_id for user {firebase_uid}")
+        
+        # Process each item in the transaction
+        for item in data.get("items", []):
+            product_id = item.get("product", {}).get("id")
+            
+            if not product_id:
+                continue
+            
+            try:
+                # Fetch product details
+                product_details = paddle.products.get(product_id)
+                custom_data = getattr(product_details, "custom_data", {}) or {}
+                product_type = custom_data.get("type")
+                product_name = getattr(product_details, "name", "Unknown")
+                
                 if product_type == "credits":
-                    credits_to_add = (getattr(product_details, "custom_data", None) or {}).get("credits", 0)
-                    user_ref.update({"credits": firestore.Increment(credits_to_add)})
-                    print(f"Added {credits_to_add} credits to user {firebase_uid}")
+                    # Add credits to user account
+                    credits_to_add = custom_data.get("credits", 0)
+                    if credits_to_add > 0:
+                        user_ref.update({"credits": firestore.Increment(credits_to_add)})
+                        print(f"✓ Added {credits_to_add} credits to user {firebase_uid}")
+                
                 elif product_type == "subscription":
+                    # Activate subscription
+                    subscription_id = data.get("subscription_id")
                     user_ref.set({
-                        "premium_status": getattr(product_details, "name", None),
-                        "subscription_id": data.get("subscription_id"),
+                        "premium_status": product_name,
+                        "subscription_id": subscription_id,
                         "subscription_status": "active"
                     }, merge=True)
-                    print(f"ACTIVATED subscription for user {firebase_uid}")
-
-        elif event_type == "subscription.canceled":
-            customer_id = data.get("customer_id")
-            users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
-            for user_doc in users_query:
-                user_ref = user_doc.reference
-                user_ref.update({"premium_status": None, "subscription_status": "canceled"})
-                print(f"CANCELED subscription for user {user_doc.id}")
-
-        elif event_type in ("subscription.updated", "subscription.past_due"):
-            customer_id = data.get("customer_id")
-            subscription_status = data.get("status")
-            users_query = db.collection('users').where('paddle_customer_id', '==', customer_id).limit(1).stream()
-            for user_doc in users_query:
-                user_ref = user_doc.reference
-                if subscription_status != 'active':
-                    user_ref.update({"premium_status": None, "subscription_status": subscription_status})
-                    print(f"DEACTIVATED subscription for user {user_doc.id} due to status: {subscription_status}")
-                else:
-                    user_ref.update({"subscription_status": "active"})
-
-        return {"status": "received"}
-    except ApiError as e:
-        raise HTTPException(status_code=500, detail=f"Paddle API error: {getattr(e, 'message', str(e))}")
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid signature")
+                    print(f"✓ Activated subscription '{product_name}' for user {firebase_uid}")
+            
+            except Exception as e:
+                print(f"WARNING: Unable to fetch product {product_id}: {e}")
+                continue
+    
     except Exception as e:
-        print(f"Error processing webhook: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        print(f"ERROR: Failed to handle transaction.completed: {e}")
+        raise
+
+
+async def handle_subscription_created(data: dict):
+    """Handle subscription.created event"""
+    customer_id = data.get("customer_id")
+    subscription_id = data.get("id")
+    status = data.get("status")
+    custom_data = data.get("custom_data", {})
+    firebase_uid = custom_data.get("firebase_uid")
+    
+    print(f"✓ Subscription created: {subscription_id} (status: {status})")
+    
+    if firebase_uid:
+        try:
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.set({
+                "paddle_customer_id": customer_id,
+                "subscription_id": subscription_id,
+                "subscription_status": status
+            }, merge=True)
+            print(f"✓ Updated subscription for user {firebase_uid}")
+        except Exception as e:
+            print(f"ERROR: Failed to update user on subscription.created: {e}")
+
+
+async def handle_subscription_updated(data: dict):
+    """Handle subscription.updated event"""
+    customer_id = data.get("customer_id")
+    subscription_id = data.get("id")
+    subscription_status = data.get("status")
+    
+    try:
+        # Find user by paddle_customer_id
+        users_query = db.collection('users').where(
+            'paddle_customer_id', '==', customer_id
+        ).limit(1).stream()
+        
+        for user_doc in users_query:
+            user_ref = user_doc.reference
+            
+            if subscription_status != 'active':
+                # Deactivate premium if not active
+                user_ref.update({
+                    "premium_status": None,
+                    "subscription_status": subscription_status
+                })
+                print(f"✓ Deactivated subscription for user {user_doc.id} (status: {subscription_status})")
+            else:
+                # Keep subscription active
+                user_ref.update({"subscription_status": "active"})
+                print(f"✓ Subscription remains active for user {user_doc.id}")
+    
+    except Exception as e:
+        print(f"ERROR: Failed to handle subscription.updated: {e}")
+
+
+async def handle_subscription_canceled(data: dict):
+    """Handle subscription.canceled event"""
+    customer_id = data.get("customer_id")
+    subscription_id = data.get("id")
+    
+    try:
+        # Find user by paddle_customer_id
+        users_query = db.collection('users').where(
+            'paddle_customer_id', '==', customer_id
+        ).limit(1).stream()
+        
+        for user_doc in users_query:
+            user_ref = user_doc.reference
+            user_ref.update({
+                "premium_status": None,
+                "subscription_status": "canceled"
+            })
+            print(f"✓ Canceled subscription for user {user_doc.id}")
+    
+    except Exception as e:
+        print(f"ERROR: Failed to handle subscription.canceled: {e}")
+
+
+async def handle_subscription_past_due(data: dict):
+    """Handle subscription.past_due event"""
+    customer_id = data.get("customer_id")
+    subscription_status = data.get("status")
+    
+    try:
+        # Find user by paddle_customer_id
+        users_query = db.collection('users').where(
+            'paddle_customer_id', '==', customer_id
+        ).limit(1).stream()
+        
+        for user_doc in users_query:
+            user_ref = user_doc.reference
+            user_ref.update({
+                "subscription_status": subscription_status
+            })
+            print(f"✓ Marked subscription as past_due for user {user_doc.id}")
+    
+    except Exception as e:
+        print(f"ERROR: Failed to handle subscription.past_due: {e}")
+
+
+@app.get("/subscription-status/{user_id}")
+async def get_subscription_status(user_id: str):
+    """
+    Get current subscription status for a user.
+    Useful for frontend to check subscription state.
+    """
+    try:
+        user_doc = db.collection('users').document(user_id).get()
+        
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_data = user_doc.to_dict()
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "premium_status": user_data.get("premium_status"),
+            "subscription_status": user_data.get("subscription_status"),
+            "subscription_id": user_data.get("subscription_id"),
+            "paddle_customer_id": user_data.get("paddle_customer_id"),
+            "credits": user_data.get("credits", 0),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching subscription status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch subscription status")
 
 
 @app.get("/health")
