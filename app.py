@@ -241,7 +241,7 @@ async def get_products(status: str = Query("active", description="Filter by prod
     Enhanced for frontend compatibility with proper sorting and filtering.
     """
     try:
-        params = {"status": status, "include": "prices"}
+        params = {"include": ["prices"]}
         product_iter = paddle.products.list(**params)
 
         serialized_products = []
