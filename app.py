@@ -62,7 +62,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 required_envs = [
     "PADDLE_API_KEY",
     "PADDLE_WEBHOOK_SECRET",
-    "FIREBASE_DATABASE_URL",
     "FIREBASE_SERVICE_ACCOUNT_BASE64",
     "FAL_AI_KEY",
 ]
