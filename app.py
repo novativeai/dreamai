@@ -231,44 +231,82 @@ def serialize_product(p: Any) -> Dict[str, Any]:
     }
 
 
-# --- ALL OTHER ENDPOINTS (products, checkouts, webhooks, health) ---
-
 @app.get("/products")
-async def get_products(status: str = Query("active", description="Filter by product status: active/archived")):
+async def get_products():
     """
-    Fetch products from Paddle (includes prices). Returns JSON-serializable list.
-    Uses SDK's products.list(...) which yields paginated results.
-    Enhanced for frontend compatibility with proper sorting and filtering.
+    Fetch products from Paddle with their prices.
     """
     try:
-        params = {"include": ["prices"]}
-        product_iter = paddle.products.list(**params)
-
+        # List all products - no parameters supported
+        product_iter = paddle.products.list()
+        
         serialized_products = []
         for p in product_iter:
-            serialized = serialize_product(p)
-            # Ensure custom_data exists for frontend filtering
-            if not serialized.get("custom_data"):
-                serialized["custom_data"] = {}
+            # Get product ID
+            prod_id = getattr(p, "id", None)
+            
+            # Fetch prices for this product
+            prices_list = []
+            if prod_id:
+                try:
+                    # Get prices for this product
+                    price_iter = paddle.prices.list()
+                    for price in price_iter:
+                        # Check if price belongs to this product
+                        price_product_id = getattr(price, "product_id", None)
+                        if price_product_id == prod_id:
+                            prices_list.append(serialize_price(price))
+                except Exception as e:
+                    print(f"Warning: Could not fetch prices for product {prod_id}: {e}")
+            
+            # Serialize product with prices
+            serialized = serialize_product_with_prices(p, prices_list)
             serialized_products.append(serialized)
-
-        # Sort by custom_data.isRecommended for frontend display
+        
+        # Sort by recommended
         serialized_products.sort(
             key=lambda x: (
                 x.get("custom_data", {}).get("isRecommended") is not True,
                 x.get("name", "")
             )
         )
-
+        
         return {"success": True, "data": serialized_products}
-
+        
     except ApiError as e:
-        detail = getattr(e, "message", str(e))
-        print(f"Paddle API error in /products: {detail}")
-        raise HTTPException(status_code=502, detail=f"Paddle API error: {detail}")
+        print(f"Paddle API error: {e}")
+        raise HTTPException(status_code=502, detail=f"Paddle API error: {str(e)}")
     except Exception as e:
-        print(f"Internal error in /products: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+        print(f"Internal error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+
+def serialize_price(price):
+    """Serialize a price object"""
+    return {
+        "id": getattr(price, "id", None),
+        "product_id": getattr(price, "product_id", None),
+        "unit_price": {
+            "amount": getattr(getattr(price, "unit_price", None), "amount", None),
+            "currency_code": getattr(getattr(price, "unit_price", None), "currency_code", "USD"),
+        },
+        "billing_cycle": {
+            "interval": getattr(getattr(price, "billing_cycle", None), "interval", None),
+            "frequency": getattr(getattr(price, "billing_cycle", None), "frequency", None),
+        } if getattr(price, "billing_cycle", None) else None,
+    }
+
+
+def serialize_product_with_prices(p, prices_list):
+    """Serialize product with its prices"""
+    return {
+        "id": getattr(p, "id", None),
+        "name": getattr(p, "name", None),
+        "description": getattr(p, "description", None),
+        "status": getattr(p, "status", None),
+        "custom_data": getattr(p, "custom_data", None) or {},
+        "prices": prices_list,
+    }
 
 
 @app.post("/create-checkout")
