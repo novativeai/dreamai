@@ -197,7 +197,22 @@ async def get_products():
             prod_name = getattr(product, "name", "")
             prod_description = getattr(product, "description", "")
             prod_status = getattr(product, "status", "active")
-            custom_data = getattr(product, "custom_data", None) or {}
+            
+            # ✅ FIX: Handle CustomData object properly
+            custom_data_obj = getattr(product, "custom_data", None)
+            custom_data = {}
+            if custom_data_obj:
+                # Convert CustomData object to dict
+                if hasattr(custom_data_obj, '__dict__'):
+                    custom_data = custom_data_obj.__dict__
+                elif isinstance(custom_data_obj, dict):
+                    custom_data = custom_data_obj
+                else:
+                    # Try to convert to dict
+                    try:
+                        custom_data = dict(custom_data_obj)
+                    except:
+                        custom_data = {}
             
             # Skip archived products
             if prod_status != "active":
@@ -253,8 +268,21 @@ async def get_products():
                     # Build description
                     price_description = getattr(price, "description", None) or prod_description
                     
+                    # ✅ FIX: Handle price custom_data the same way
+                    price_custom_data_obj = getattr(price, "custom_data", None)
+                    price_custom_data = {}
+                    if price_custom_data_obj:
+                        if hasattr(price_custom_data_obj, '__dict__'):
+                            price_custom_data = price_custom_data_obj.__dict__
+                        elif isinstance(price_custom_data_obj, dict):
+                            price_custom_data = price_custom_data_obj
+                        else:
+                            try:
+                                price_custom_data = dict(price_custom_data_obj)
+                            except:
+                                price_custom_data = {}
+                    
                     # Check if recommended from product or price custom_data
-                    price_custom_data = getattr(price, "custom_data", None) or {}
                     is_recommended = (
                         custom_data.get("isRecommended", False) or 
                         price_custom_data.get("isRecommended", False)
@@ -296,7 +324,7 @@ async def get_products():
             key=lambda x: (
                 x.get("isRecommended") is not True,
                 x.get("name", ""),
-                x.get("interval", ""),
+                x.get("interval", "") or "",
             )
         )
         
