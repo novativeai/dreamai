@@ -180,135 +180,124 @@ async def generate_image(
 # ---------------------------
 # Helper: serialize product object from SDK or dict
 # ---------------------------
-def serialize_product(p: Any) -> Dict[str, Any]:
-    """
-    Convert a product SDK object or dict into a plain JSON-serializable dict.
-    Includes prices (if present).
-    """
-    # product id / name / description / status / custom_data
-    if isinstance(p, dict):
-        prod_id = p.get("id")
-        name = p.get("name")
-        description = p.get("description")
-        status_attr = p.get("status")
-        custom_data = p.get("custom_data")
-        raw_prices = p.get("prices", [])
-    else:
-        prod_id = getattr(p, "id", None) or getattr(p, "product_id", None)
-        name = getattr(p, "name", None)
-        description = getattr(p, "description", None)
-        status_attr = getattr(p, "status", None)
-        custom_data = getattr(p, "custom_data", None)
-        raw_prices = getattr(p, "prices", None) or []
 
-    prices = []
-    for pr in raw_prices or []:
-        if isinstance(pr, dict):
-            price_id = pr.get("id")
-            amount = pr.get("price") or pr.get("amount")
-            currency = pr.get("currency")
-            billing_cycle = pr.get("billing_cycle")
-            interval = pr.get("interval")
-        else:
-            price_id = getattr(pr, "id", None)
-            amount = getattr(pr, "price", None) or getattr(pr, "amount", None)
-            currency = getattr(pr, "currency", None)
-            billing_cycle = getattr(pr, "billing_cycle", None)
-            interval = getattr(pr, "interval", None)
-        prices.append({
-            "id": price_id,
-            "amount": amount,
-            "currency": currency,
-            "billing_cycle": billing_cycle,
-            "interval": interval,
-        })
-
-    return {
-        "id": prod_id,
-        "name": name,
-        "description": description,
-        "status": status_attr,
-        "custom_data": custom_data,
-        "prices": prices,
-    }
 
 
 @app.get("/products")
 async def get_products():
     """
-    Fetch products from Paddle with their prices.
+    Fetch products from Paddle and transform them for frontend consumption.
+    Each price becomes a separate "subscription plan" option.
     """
     try:
-        # List all products - no parameters supported
         product_iter = paddle.products.list()
+        subscription_plans = []
         
-        serialized_products = []
-        for p in product_iter:
-            # Get product ID
-            prod_id = getattr(p, "id", None)
+        for product in product_iter:
+            prod_id = getattr(product, "id", None)
+            prod_name = getattr(product, "name", "")
+            prod_description = getattr(product, "description", "")
+            prod_status = getattr(product, "status", "active")
+            custom_data = getattr(product, "custom_data", None) or {}
             
-            # Fetch prices for this product
-            prices_list = []
-            if prod_id:
-                try:
-                    # Get prices for this product
-                    price_iter = paddle.prices.list()
-                    for price in price_iter:
-                        # Check if price belongs to this product
-                        price_product_id = getattr(price, "product_id", None)
-                        if price_product_id == prod_id:
-                            prices_list.append(serialize_price(price))
-                except Exception as e:
-                    print(f"Warning: Could not fetch prices for product {prod_id}: {e}")
+            # Skip archived products
+            if prod_status != "active":
+                continue
             
-            # Serialize product with prices
-            serialized = serialize_product_with_prices(p, prices_list)
-            serialized_products.append(serialized)
+            if not prod_id:
+                continue
+            
+            # ✅ Efficiently fetch prices for THIS product only
+            try:
+                price_iter = paddle.prices.list(product_id=prod_id)
+                
+                for price in price_iter:
+                    price_id = getattr(price, "id", None)
+                    price_status = getattr(price, "status", "active")
+                    
+                    # Skip archived prices
+                    if price_status != "active" or not price_id:
+                        continue
+                    
+                    # Extract unit price
+                    unit_price = getattr(price, "unit_price", None)
+                    amount = getattr(unit_price, "amount", "0") if unit_price else "0"
+                    currency = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
+                    
+                    # Extract billing cycle
+                    billing_cycle = getattr(price, "billing_cycle", None)
+                    interval = None
+                    frequency = None
+                    if billing_cycle:
+                        interval = getattr(billing_cycle, "interval", None)
+                        frequency = getattr(billing_cycle, "frequency", 1)
+                    
+                    # Format price for display
+                    price_amount = float(amount) / 100  # Convert cents to dollars
+                    currency_symbol = "$" if currency == "USD" else currency
+                    formatted_price = f"{currency_symbol}{price_amount:.2f}"
+                    
+                    # Build interval display
+                    interval_display = None
+                    if interval:
+                        if frequency == 1:
+                            interval_display = interval  # "month", "year"
+                        else:
+                            interval_display = f"{frequency} {interval}s"  # "3 months"
+                    
+                    # Get price name (usually describes billing frequency)
+                    price_name = getattr(price, "name", None) or prod_name
+                    
+                    # Build description
+                    price_description = getattr(price, "description", None) or prod_description
+                    
+                    # Check if recommended from product or price custom_data
+                    price_custom_data = getattr(price, "custom_data", None) or {}
+                    is_recommended = (
+                        custom_data.get("isRecommended", False) or 
+                        price_custom_data.get("isRecommended", False)
+                    )
+                    
+                    # Transform into frontend format
+                    subscription_plans.append({
+                        "id": price_id,  # Use PRICE ID for checkout
+                        "productId": prod_id,  # Include product ID for reference
+                        "name": prod_name,  # Product name (DreamAI Premium)
+                        "priceName": price_name,  # Price name (Monthly, Annual)
+                        "price": formatted_price,
+                        "interval": interval,
+                        "frequency": frequency,
+                        "description": price_description,
+                        "isRecommended": is_recommended,
+                        "currency": currency,
+                        "rawAmount": amount,  # Keep raw amount for calculations
+                    })
+                    
+            except Exception as e:
+                print(f"Warning: Could not fetch prices for product {prod_id}: {e}")
+                continue
         
-        # Sort by recommended
-        serialized_products.sort(
+        # Sort: recommended first, then by name
+        subscription_plans.sort(
             key=lambda x: (
-                x.get("custom_data", {}).get("isRecommended") is not True,
-                x.get("name", "")
+                x.get("isRecommended") is not True,
+                x.get("name", ""),
+                x.get("interval", ""),
             )
         )
         
-        return {"success": True, "data": serialized_products}
+        return {"success": True, "data": subscription_plans}
         
     except ApiError as e:
         print(f"Paddle API error: {e}")
         raise HTTPException(status_code=502, detail=f"Paddle API error: {str(e)}")
     except Exception as e:
         print(f"Internal error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
-def serialize_price(price):
-    """Serialize a price object"""
-    return {
-        "id": getattr(price, "id", None),
-        "product_id": getattr(price, "product_id", None),
-        "unit_price": {
-            "amount": getattr(getattr(price, "unit_price", None), "amount", None),
-            "currency_code": getattr(getattr(price, "unit_price", None), "currency_code", "USD"),
-        },
-        "billing_cycle": {
-            "interval": getattr(getattr(price, "billing_cycle", None), "interval", None),
-            "frequency": getattr(getattr(price, "billing_cycle", None), "frequency", None),
-        } if getattr(price, "billing_cycle", None) else None,
-    }
-
-
-def serialize_product_with_prices(p, prices_list):
-    """Serialize product with its prices"""
-    return {
-        "id": getattr(p, "id", None),
-        "name": getattr(p, "name", None),
-        "description": getattr(p, "description", None),
-        "status": getattr(p, "status", None),
-        "custom_data": getattr(p, "custom_data", None) or {},
-        "prices": prices_list,
-    }
 
 
 @app.post("/create-checkout")
