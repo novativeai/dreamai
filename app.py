@@ -185,29 +185,29 @@ async def generate_image(
 async def get_products():
     """
     Fetch products from Paddle and transform them for frontend consumption.
-    DEBUG VERSION - with extensive logging
     """
     try:
-        print("=" * 60)
-        print("🔍 FETCHING PRODUCTS FROM PADDLE")
-        print("=" * 60)
+        print("🔍 Fetching all products and prices...")
         
-        product_iter = paddle.products.list()
+        # Fetch all products and prices once
+        all_products = list(paddle.products.list())
+        all_prices = list(paddle.prices.list())
+        
+        print(f"✅ Found {len(all_products)} products and {len(all_prices)} prices")
+        
         subscription_plans = []
         
-        product_count = 0
-        for product in product_iter:
-            product_count += 1
+        for product in all_products:
             prod_id = getattr(product, "id", None)
             prod_name = getattr(product, "name", "")
+            prod_description = getattr(product, "description", "")
             prod_status = getattr(product, "status", "active")
             
-            print(f"\n📦 Product #{product_count}:")
-            print(f"   ID: {prod_id}")
-            print(f"   Name: {prod_name}")
-            print(f"   Status: {prod_status}")
+            # Skip archived products
+            if prod_status != "active" or not prod_id:
+                continue
             
-            # Check custom_data
+            # ✅ FIX: Handle nested custom_data
             def safe_dict(obj):
                 if obj is None:
                     return {}
@@ -218,86 +218,104 @@ async def get_products():
                 except TypeError:
                     return getattr(obj, '__dict__', {})
             
-            custom_data = safe_dict(getattr(product, "custom_data", None))
-            print(f"   Custom Data: {custom_data}")
+            custom_data_raw = safe_dict(getattr(product, "custom_data", None))
             
-            # Skip archived products
-            if prod_status != "active":
-                print(f"   ❌ SKIPPED: Product not active (status={prod_status})")
+            # ✅ CRITICAL: Extract nested 'data' key
+            custom_data = custom_data_raw.get('data', custom_data_raw)
+            
+            print(f"📦 {prod_name}: custom_data = {custom_data}")
+            
+            # Determine product type
+            product_type = custom_data.get("type", custom_data.get("planType", "subscription"))
+            
+            # ✅ Filter prices for this product
+            product_prices = [p for p in all_prices if getattr(p, "product_id", None) == prod_id]
+            print(f"   Found {len(product_prices)} prices")
+            
+            if len(product_prices) == 0:
+                print(f"   ⚠️ No prices for {prod_name}, skipping")
                 continue
             
-            if not prod_id:
-                print(f"   ❌ SKIPPED: No product ID")
-                continue
-            
-            # Fetch prices
-            print(f"   🔍 Fetching prices for product {prod_id}...")
-            try:
-                price_iter = paddle.prices.list(product_id=prod_id)
-                price_count = 0
+            for price in product_prices:
+                price_id = getattr(price, "id", None)
+                price_status = getattr(price, "status", "active")
                 
-                for price in price_iter:
-                    price_count += 1
-                    price_id = getattr(price, "id", None)
-                    price_status = getattr(price, "status", "active")
-                    price_name = getattr(price, "name", "Unnamed")
-                    
-                    # Get unit price info
-                    unit_price = getattr(price, "unit_price", None)
-                    amount = getattr(unit_price, "amount", "0") if unit_price else "0"
-                    
-                    print(f"      💰 Price #{price_count}:")
-                    print(f"         ID: {price_id}")
-                    print(f"         Name: {price_name}")
-                    print(f"         Status: {price_status}")
-                    print(f"         Amount: {amount}")
-                    
-                    if price_status != "active":
-                        print(f"         ❌ SKIPPED: Price not active")
-                        continue
-                    
-                    if not price_id:
-                        print(f"         ❌ SKIPPED: No price ID")
-                        continue
-                    
-                    # If we got here, we'll add it
-                    print(f"         ✅ ADDING TO RESULTS")
-                    
-                    # Extract all the data (simplified for debugging)
-                    currency = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
-                    billing_cycle = getattr(price, "billing_cycle", None)
-                    interval = getattr(billing_cycle, "interval", None) if billing_cycle else None
-                    
-                    price_amount = float(amount) / 100
-                    formatted_price = f"${price_amount:.2f}"
-                    
-                    subscription_plans.append({
-                        "id": price_id,
-                        "productId": prod_id,
-                        "name": prod_name,
-                        "price": formatted_price,
-                        "interval": interval,
-                        "description": getattr(product, "description", ""),
-                        "isRecommended": custom_data.get("isRecommended", False),
-                    })
+                if price_status != "active" or not price_id:
+                    continue
                 
-                print(f"   📊 Found {price_count} prices for this product")
+                # Extract unit price
+                unit_price = getattr(price, "unit_price", None)
+                amount = getattr(unit_price, "amount", "0") if unit_price else "0"
+                currency = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
                 
-                if price_count == 0:
-                    print(f"   ⚠️  WARNING: No prices found for product {prod_id}")
-                    
-            except Exception as e:
-                print(f"   ❌ ERROR fetching prices: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                # Extract billing cycle
+                billing_cycle = getattr(price, "billing_cycle", None)
+                interval = None
+                frequency = None
+                if billing_cycle:
+                    interval = getattr(billing_cycle, "interval", None)
+                    frequency = getattr(billing_cycle, "frequency", 1)
+                
+                # Format price
+                price_amount = float(amount) / 100
+                currency_symbol = "$" if currency == "USD" else currency
+                formatted_price = f"{currency_symbol}{price_amount:.2f}"
+                
+                # Get names
+                price_name = getattr(price, "name", None) or prod_name
+                price_description = getattr(price, "description", None) or prod_description
+                
+                # Handle price custom_data (also might be nested)
+                price_custom_data_raw = safe_dict(getattr(price, "custom_data", None))
+                price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
+                
+                # Check if recommended
+                is_recommended = (
+                    custom_data.get("isRecommended", False) or 
+                    price_custom_data.get("isRecommended", False)
+                )
+                
+                # Detect if subscription (has billing interval)
+                is_subscription = interval is not None
+                
+                # Build response
+                plan_data = {
+                    "id": price_id,
+                    "productId": prod_id,
+                    "name": prod_name,
+                    "priceName": price_name,
+                    "price": formatted_price,
+                    "interval": interval,
+                    "frequency": frequency,
+                    "description": price_description,
+                    "isRecommended": is_recommended,
+                    "currency": currency,
+                    "rawAmount": amount,
+                }
+                
+                # Add type-specific fields
+                if not is_subscription:
+                    # Credit package
+                    plan_data["type"] = "credits"
+                    plan_data["credits"] = int(custom_data.get("amount", 0))
+                    plan_data["isPopular"] = custom_data.get("isPopular", False)
+                else:
+                    # Subscription
+                    plan_data["type"] = "subscription"
+                
+                subscription_plans.append(plan_data)
+                print(f"   ✅ Added: {price_name} ({price_id})")
         
-        print(f"\n" + "=" * 60)
-        print(f"📊 SUMMARY:")
-        print(f"   Total products found: {product_count}")
-        print(f"   Total plans to return: {len(subscription_plans)}")
-        print("=" * 60)
+        # Sort: recommended first, then by name
+        subscription_plans.sort(
+            key=lambda x: (
+                x.get("isRecommended") is not True,
+                x.get("name", ""),
+                x.get("interval", "") or "",
+            )
+        )
         
+        print(f"✅ Returning {len(subscription_plans)} plans")
         return {"success": True, "data": subscription_plans}
         
     except ApiError as e:
@@ -423,17 +441,13 @@ async def create_customer_portal(request: Request):
 
 @app.post("/paddle-webhook")
 async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
-    """
-    Handle Paddle webhook events.
-    CRITICAL: Must respond within 5 seconds to prevent retries.
-    Enhanced with better logging and error handling.
-    """
+    """Handle Paddle webhook events."""
     if not paddle_signature:
         print("ERROR: Missing Paddle-Signature header")
         raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
     
     try:
-        # Get raw body for signature verification
+        # Read body once
         body_bytes = await request.body()
         webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
         
@@ -441,10 +455,10 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
             print("ERROR: PADDLE_WEBHOOK_SECRET not configured")
             raise HTTPException(status_code=500, detail="PADDLE_WEBHOOK_SECRET not configured")
 
-        # Verify webhook signature
+        # Verify signature
         verifier = Verifier()
         secret = Secret(webhook_secret)
-
+        
         try:
             integrity_ok = verifier.verify(request, secret)
         except Exception as verify_error:
@@ -455,8 +469,8 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
             print("ERROR: Webhook signature verification failed")
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-        # Parse event data
-        event_data = await request.json()
+        # ✅ FIX: Parse the body_bytes we already read
+        event_data = json.loads(body_bytes)
         event_type = event_data.get("event_type")
         event_id = event_data.get("event_id")
         data = event_data.get("data")
