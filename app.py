@@ -187,7 +187,6 @@ async def generate_image(
 async def get_products():
     """
     Fetch products from Paddle and transform them for frontend consumption.
-    Each price becomes a separate "subscription plan" option.
     """
     try:
         product_iter = paddle.products.list()
@@ -206,6 +205,9 @@ async def get_products():
             
             if not prod_id:
                 continue
+            
+            # Determine product type from custom_data
+            product_type = custom_data.get("type", "subscription")  # Default to subscription
             
             # ✅ Efficiently fetch prices for THIS product only
             try:
@@ -258,11 +260,15 @@ async def get_products():
                         price_custom_data.get("isRecommended", False)
                     )
                     
+                    # Get credits amount if this is a credit package
+                    credits = custom_data.get("credits", 0)
+                    is_popular = custom_data.get("isPopular", False)
+                    
                     # Transform into frontend format
-                    subscription_plans.append({
+                    plan_data = {
                         "id": price_id,  # Use PRICE ID for checkout
                         "productId": prod_id,  # Include product ID for reference
-                        "name": prod_name,  # Product name (DreamAI Premium)
+                        "name": prod_name,  # Product name
                         "priceName": price_name,  # Price name (Monthly, Annual)
                         "price": formatted_price,
                         "interval": interval,
@@ -271,7 +277,15 @@ async def get_products():
                         "isRecommended": is_recommended,
                         "currency": currency,
                         "rawAmount": amount,  # Keep raw amount for calculations
-                    })
+                        "type": product_type,  # "subscription" or "credits"
+                    }
+                    
+                    # Add credit-specific fields if applicable
+                    if product_type == "credits":
+                        plan_data["credits"] = credits
+                        plan_data["isPopular"] = is_popular
+                    
+                    subscription_plans.append(plan_data)
                     
             except Exception as e:
                 print(f"Warning: Could not fetch prices for product {prod_id}: {e}")
@@ -296,9 +310,6 @@ async def get_products():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-
-
 
 @app.post("/create-checkout")
 async def create_checkout(request: Request):
