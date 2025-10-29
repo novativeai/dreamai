@@ -441,13 +441,17 @@ async def create_customer_portal(request: Request):
 
 @app.post("/paddle-webhook")
 async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
-    """Handle Paddle webhook events."""
+    """
+    Handle Paddle webhook events.
+    CRITICAL: Must respond within 5 seconds to prevent retries.
+    Enhanced with better logging and error handling.
+    """
     if not paddle_signature:
         print("ERROR: Missing Paddle-Signature header")
         raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
     
     try:
-        # Read body once
+        # Get raw body for signature verification
         body_bytes = await request.body()
         webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
         
@@ -455,10 +459,10 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
             print("ERROR: PADDLE_WEBHOOK_SECRET not configured")
             raise HTTPException(status_code=500, detail="PADDLE_WEBHOOK_SECRET not configured")
 
-        # Verify signature
+        # Verify webhook signature
         verifier = Verifier()
         secret = Secret(webhook_secret)
-        
+
         try:
             integrity_ok = verifier.verify(request, secret)
         except Exception as verify_error:
@@ -469,8 +473,8 @@ async def paddle_webhook(request: Request, paddle_signature: str = Header(None))
             print("ERROR: Webhook signature verification failed")
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-        # ✅ FIX: Parse the body_bytes we already read
-        event_data = json.loads(body_bytes)
+        # Parse event data
+        event_data = await request.json()
         event_type = event_data.get("event_type")
         event_id = event_data.get("event_id")
         data = event_data.get("data")
