@@ -438,241 +438,151 @@ async def create_customer_portal(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
-
-@app.post("/paddle-webhook")
-async def paddle_webhook(request: Request, paddle_signature: str = Header(None)):
+@app.get("/products")
+async def get_products():
     """
-    Handle Paddle webhook events.
-    CRITICAL: Must respond within 5 seconds to prevent retries.
-    Enhanced with better logging and error handling.
+    Fetch products from Paddle and transform them for frontend consumption.
     """
-    if not paddle_signature:
-        print("ERROR: Missing Paddle-Signature header")
-        raise HTTPException(status_code=400, detail="Missing Paddle-Signature header")
-    
     try:
-        # Get raw body for signature verification
-        body_bytes = await request.body()
-        webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
+        print("🔍 Fetching all products and prices...")
         
-        if not webhook_secret:
-            print("ERROR: PADDLE_WEBHOOK_SECRET not configured")
-            raise HTTPException(status_code=500, detail="PADDLE_WEBHOOK_SECRET not configured")
-
-        # Verify webhook signature
-        verifier = Verifier()
-        secret = Secret(webhook_secret)
-
-        try:
-            integrity_ok = verifier.verify(request, secret)
-        except Exception as verify_error:
-            print(f"ERROR: Signature verification failed: {verify_error}")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        # Fetch all products and prices once
+        all_products = list(paddle.products.list())
+        all_prices = list(paddle.prices.list())
         
-        if not integrity_ok:
-            print("ERROR: Webhook signature verification failed")
-            raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
-        # Parse event data
-        event_data = await request.json()
-        event_type = event_data.get("event_type")
-        event_id = event_data.get("event_id")
-        data = event_data.get("data")
-
-        print(f"✓ Received webhook: {event_type} (ID: {event_id})")
-
-        # Process different event types
-        if event_type == "transaction.completed":
-            await handle_transaction_completed(data)
+        print(f"✅ Found {len(all_products)} products and {len(all_prices)} prices")
         
-        elif event_type == "subscription.created":
-            await handle_subscription_created(data)
+        subscription_plans = []
         
-        elif event_type == "subscription.updated":
-            await handle_subscription_updated(data)
+        for product in all_products:
+            prod_id = getattr(product, "id", None)
+            prod_name = getattr(product, "name", "")
+            prod_description = getattr(product, "description", "")
+            prod_status = getattr(product, "status", "active")
+            
+            # Skip archived products
+            if prod_status != "active" or not prod_id:
+                continue
+            
+            # ✅ FIX: Handle nested custom_data
+            def safe_dict(obj):
+                if obj is None:
+                    return {}
+                if isinstance(obj, dict):
+                    return obj
+                try:
+                    return vars(obj)
+                except TypeError:
+                    return getattr(obj, '__dict__', {})
+            
+            custom_data_raw = safe_dict(getattr(product, "custom_data", None))
+            
+            # ✅ CRITICAL: Extract nested 'data' key
+            custom_data = custom_data_raw.get('data', custom_data_raw)
+            
+            print(f"📦 {prod_name}: custom_data = {custom_data}")
+            
+            # Determine product type
+            product_type = custom_data.get("type", custom_data.get("planType", "subscription"))
+            
+            # ✅ Filter prices for this product
+            product_prices = [p for p in all_prices if getattr(p, "product_id", None) == prod_id]
+            print(f"   Found {len(product_prices)} prices")
+            
+            if len(product_prices) == 0:
+                print(f"   ⚠️ No prices for {prod_name}, skipping")
+                continue
+            
+            for price in product_prices:
+                price_id = getattr(price, "id", None)
+                price_status = getattr(price, "status", "active")
+                
+                if price_status != "active" or not price_id:
+                    continue
+                
+                # Extract unit price
+                unit_price = getattr(price, "unit_price", None)
+                amount = getattr(unit_price, "amount", "0") if unit_price else "0"
+                currency = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
+                
+                # Extract billing cycle
+                billing_cycle = getattr(price, "billing_cycle", None)
+                interval = None
+                frequency = None
+                if billing_cycle:
+                    interval = getattr(billing_cycle, "interval", None)
+                    frequency = getattr(billing_cycle, "frequency", 1)
+                
+                # Format price
+                price_amount = float(amount) / 100
+                currency_symbol = "$" if currency == "USD" else currency
+                formatted_price = f"{currency_symbol}{price_amount:.2f}"
+                
+                # Get names
+                price_name = getattr(price, "name", None) or prod_name
+                price_description = getattr(price, "description", None) or prod_description
+                
+                # Handle price custom_data (also might be nested)
+                price_custom_data_raw = safe_dict(getattr(price, "custom_data", None))
+                price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
+                
+                # Check if recommended
+                is_recommended = (
+                    custom_data.get("isRecommended", False) or 
+                    price_custom_data.get("isRecommended", False)
+                )
+                
+                # Detect if subscription (has billing interval)
+                is_subscription = interval is not None
+                
+                # Build response
+                plan_data = {
+                    "id": price_id,
+                    "productId": prod_id,
+                    "name": prod_name,
+                    "priceName": price_name,
+                    "price": formatted_price,
+                    "interval": interval,
+                    "frequency": frequency,
+                    "description": price_description,
+                    "isRecommended": is_recommended,
+                    "currency": currency,
+                    "rawAmount": amount,
+                }
+                
+                # Add type-specific fields
+                if not is_subscription:
+                    # Credit package
+                    plan_data["type"] = "credits"
+                    plan_data["credits"] = int(custom_data.get("amount", 0))
+                    plan_data["isPopular"] = custom_data.get("isPopular", False)
+                else:
+                    # Subscription
+                    plan_data["type"] = "subscription"
+                
+                subscription_plans.append(plan_data)
+                print(f"   ✅ Added: {price_name} ({price_id})")
         
-        elif event_type == "subscription.canceled":
-            await handle_subscription_canceled(data)
+        # Sort: recommended first, then by name
+        subscription_plans.sort(
+            key=lambda x: (
+                x.get("isRecommended") is not True,
+                x.get("name", ""),
+                x.get("interval", "") or "",
+            )
+        )
         
-        elif event_type == "subscription.past_due":
-            await handle_subscription_past_due(data)
+        print(f"✅ Returning {len(subscription_plans)} plans")
+        return {"success": True, "data": subscription_plans}
         
-        else:
-            print(f"INFO: Unhandled event type: {event_type}")
-
-        # IMPORTANT: Respond quickly (within 5 seconds)
-        return {"status": "received", "event_id": event_id}
-
-    except HTTPException:
-        raise
     except ApiError as e:
-        error_msg = getattr(e, 'message', str(e))
-        print(f"ERROR: Paddle API error in webhook: {error_msg}")
-        raise HTTPException(status_code=500, detail=f"Paddle API error: {error_msg}")
+        print(f"❌ Paddle API error: {e}")
+        raise HTTPException(status_code=502, detail=f"Paddle API error: {str(e)}")
     except Exception as e:
-        print(f"ERROR: Unexpected error in webhook processing: {e}")
+        print(f"❌ Internal error: {e}")
         import traceback
         traceback.print_exc()
-        # Still return 200 to prevent Paddle retries for non-signature errors
-        return {"status": "error", "message": "Internal processing error"}
-
-
-# --- Webhook Event Handlers ---
-
-async def handle_transaction_completed(data: dict):
-    """Handle transaction.completed event - provision access or credits"""
-    firebase_uid = data.get("custom_data", {}).get("firebase_uid")
-    
-    if not firebase_uid:
-        print("WARNING: transaction.completed missing firebase_uid")
-        return
-    
-    try:
-        user_ref = db.collection('users').document(firebase_uid)
-        paddle_customer_id = data.get("customer_id")
-        
-        # Update paddle_customer_id if available
-        if paddle_customer_id:
-            user_ref.set({"paddle_customer_id": paddle_customer_id}, merge=True)
-            print(f"✓ Updated paddle_customer_id for user {firebase_uid}")
-        
-        # Process each item in the transaction
-        for item in data.get("items", []):
-            product_id = item.get("product", {}).get("id")
-            
-            if not product_id:
-                continue
-            
-            try:
-                # Fetch product details
-                product_details = paddle.products.get(product_id)
-                custom_data = getattr(product_details, "custom_data", {}) or {}
-                product_type = custom_data.get("type")
-                product_name = getattr(product_details, "name", "Unknown")
-                
-                if product_type == "credits":
-                    # Add credits to user account
-                    credits_to_add = custom_data.get("credits", 0)
-                    if credits_to_add > 0:
-                        user_ref.update({"credits": firestore.Increment(credits_to_add)})
-                        print(f"✓ Added {credits_to_add} credits to user {firebase_uid}")
-                
-                elif product_type == "subscription":
-                    # Activate subscription
-                    subscription_id = data.get("subscription_id")
-                    user_ref.set({
-                        "premium_status": product_name,
-                        "subscription_id": subscription_id,
-                        "subscription_status": "active"
-                    }, merge=True)
-                    print(f"✓ Activated subscription '{product_name}' for user {firebase_uid}")
-            
-            except Exception as e:
-                print(f"WARNING: Unable to fetch product {product_id}: {e}")
-                continue
-    
-    except Exception as e:
-        print(f"ERROR: Failed to handle transaction.completed: {e}")
-        raise
-
-
-async def handle_subscription_created(data: dict):
-    """Handle subscription.created event"""
-    customer_id = data.get("customer_id")
-    subscription_id = data.get("id")
-    status = data.get("status")
-    custom_data = data.get("custom_data", {})
-    firebase_uid = custom_data.get("firebase_uid")
-    
-    print(f"✓ Subscription created: {subscription_id} (status: {status})")
-    
-    if firebase_uid:
-        try:
-            user_ref = db.collection('users').document(firebase_uid)
-            user_ref.set({
-                "paddle_customer_id": customer_id,
-                "subscription_id": subscription_id,
-                "subscription_status": status
-            }, merge=True)
-            print(f"✓ Updated subscription for user {firebase_uid}")
-        except Exception as e:
-            print(f"ERROR: Failed to update user on subscription.created: {e}")
-
-
-async def handle_subscription_updated(data: dict):
-    """Handle subscription.updated event"""
-    customer_id = data.get("customer_id")
-    subscription_id = data.get("id")
-    subscription_status = data.get("status")
-    
-    try:
-        # Find user by paddle_customer_id
-        users_query = db.collection('users').where(
-            'paddle_customer_id', '==', customer_id
-        ).limit(1).stream()
-        
-        for user_doc in users_query:
-            user_ref = user_doc.reference
-            
-            if subscription_status != 'active':
-                # Deactivate premium if not active
-                user_ref.update({
-                    "premium_status": None,
-                    "subscription_status": subscription_status
-                })
-                print(f"✓ Deactivated subscription for user {user_doc.id} (status: {subscription_status})")
-            else:
-                # Keep subscription active
-                user_ref.update({"subscription_status": "active"})
-                print(f"✓ Subscription remains active for user {user_doc.id}")
-    
-    except Exception as e:
-        print(f"ERROR: Failed to handle subscription.updated: {e}")
-
-
-async def handle_subscription_canceled(data: dict):
-    """Handle subscription.canceled event"""
-    customer_id = data.get("customer_id")
-    subscription_id = data.get("id")
-    
-    try:
-        # Find user by paddle_customer_id
-        users_query = db.collection('users').where(
-            'paddle_customer_id', '==', customer_id
-        ).limit(1).stream()
-        
-        for user_doc in users_query:
-            user_ref = user_doc.reference
-            user_ref.update({
-                "premium_status": None,
-                "subscription_status": "canceled"
-            })
-            print(f"✓ Canceled subscription for user {user_doc.id}")
-    
-    except Exception as e:
-        print(f"ERROR: Failed to handle subscription.canceled: {e}")
-
-
-async def handle_subscription_past_due(data: dict):
-    """Handle subscription.past_due event"""
-    customer_id = data.get("customer_id")
-    subscription_status = data.get("status")
-    
-    try:
-        # Find user by paddle_customer_id
-        users_query = db.collection('users').where(
-            'paddle_customer_id', '==', customer_id
-        ).limit(1).stream()
-        
-        for user_doc in users_query:
-            user_ref = user_doc.reference
-            user_ref.update({
-                "subscription_status": subscription_status
-            })
-            print(f"✓ Marked subscription as past_due for user {user_doc.id}")
-    
-    except Exception as e:
-        print(f"ERROR: Failed to handle subscription.past_due: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.get("/subscription-status/{user_id}")
