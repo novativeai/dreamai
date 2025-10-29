@@ -43,7 +43,9 @@ app.add_middleware(
         "https://dreamai-checkpoint.netlify.app",
         "http://localhost:8081",
         "http://localhost:3000",
-        "http://localhost:19006",  # Expo web default
+        "https://dreamai-mvp.netlify.app",
+        "http://localhost:19006",
+        # Expo web default
         "https://vision-ai-tester.netlify.app",
         "exp://localhost:8081",   # Expo native
         "*"  # Allow all origins for development - restrict in production
