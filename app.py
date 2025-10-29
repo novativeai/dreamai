@@ -182,7 +182,6 @@ async def generate_image(
 # ---------------------------
 
 
-
 @app.get("/products")
 async def get_products():
     """
@@ -198,21 +197,21 @@ async def get_products():
             prod_description = getattr(product, "description", "")
             prod_status = getattr(product, "status", "active")
             
-            # ✅ FIX: Handle CustomData object properly
-            custom_data_obj = getattr(product, "custom_data", None)
-            custom_data = {}
-            if custom_data_obj:
-                # Convert CustomData object to dict
-                if hasattr(custom_data_obj, '__dict__'):
-                    custom_data = custom_data_obj.__dict__
-                elif isinstance(custom_data_obj, dict):
-                    custom_data = custom_data_obj
-                else:
-                    # Try to convert to dict
-                    try:
-                        custom_data = dict(custom_data_obj)
-                    except:
-                        custom_data = {}
+            # ✅ VERIFIED: Safe CustomData handling
+            def safe_dict(obj):
+                """Convert CustomData object or dict to plain dict"""
+                if obj is None:
+                    return {}
+                if isinstance(obj, dict):
+                    return obj
+                # Try vars() which works with custom objects
+                try:
+                    return vars(obj)
+                except TypeError:
+                    # Last resort: try __dict__
+                    return getattr(obj, '__dict__', {})
+            
+            custom_data = safe_dict(getattr(product, "custom_data", None))
             
             # Skip archived products
             if prod_status != "active":
@@ -221,10 +220,10 @@ async def get_products():
             if not prod_id:
                 continue
             
-            # Determine product type from custom_data
-            product_type = custom_data.get("type", "subscription")  # Default to subscription
+            # Determine product type
+            product_type = custom_data.get("type", "subscription")
             
-            # ✅ Efficiently fetch prices for THIS product only
+            # ✅ Efficiently fetch prices for THIS product only (VERIFIED)
             try:
                 price_iter = paddle.prices.list(product_id=prod_id)
                 
@@ -232,7 +231,6 @@ async def get_products():
                     price_id = getattr(price, "id", None)
                     price_status = getattr(price, "status", "active")
                     
-                    # Skip archived prices
                     if price_status != "active" or not price_id:
                         continue
                     
@@ -249,66 +247,50 @@ async def get_products():
                         interval = getattr(billing_cycle, "interval", None)
                         frequency = getattr(billing_cycle, "frequency", 1)
                     
-                    # Format price for display
-                    price_amount = float(amount) / 100  # Convert cents to dollars
+                    # Format price
+                    price_amount = float(amount) / 100
                     currency_symbol = "$" if currency == "USD" else currency
                     formatted_price = f"{currency_symbol}{price_amount:.2f}"
                     
                     # Build interval display
                     interval_display = None
                     if interval:
-                        if frequency == 1:
-                            interval_display = interval  # "month", "year"
-                        else:
-                            interval_display = f"{frequency} {interval}s"  # "3 months"
+                        interval_display = interval if frequency == 1 else f"{frequency} {interval}s"
                     
-                    # Get price name (usually describes billing frequency)
+                    # Get names and descriptions
                     price_name = getattr(price, "name", None) or prod_name
-                    
-                    # Build description
                     price_description = getattr(price, "description", None) or prod_description
                     
-                    # ✅ FIX: Handle price custom_data the same way
-                    price_custom_data_obj = getattr(price, "custom_data", None)
-                    price_custom_data = {}
-                    if price_custom_data_obj:
-                        if hasattr(price_custom_data_obj, '__dict__'):
-                            price_custom_data = price_custom_data_obj.__dict__
-                        elif isinstance(price_custom_data_obj, dict):
-                            price_custom_data = price_custom_data_obj
-                        else:
-                            try:
-                                price_custom_data = dict(price_custom_data_obj)
-                            except:
-                                price_custom_data = {}
+                    # Handle price custom_data safely
+                    price_custom_data = safe_dict(getattr(price, "custom_data", None))
                     
-                    # Check if recommended from product or price custom_data
+                    # Check if recommended
                     is_recommended = (
                         custom_data.get("isRecommended", False) or 
                         price_custom_data.get("isRecommended", False)
                     )
                     
-                    # Get credits amount if this is a credit package
+                    # Get credit package fields
                     credits = custom_data.get("credits", 0)
                     is_popular = custom_data.get("isPopular", False)
                     
-                    # Transform into frontend format
+                    # Build response
                     plan_data = {
-                        "id": price_id,  # Use PRICE ID for checkout
-                        "productId": prod_id,  # Include product ID for reference
-                        "name": prod_name,  # Product name
-                        "priceName": price_name,  # Price name (Monthly, Annual)
+                        "id": price_id,
+                        "productId": prod_id,
+                        "name": prod_name,
+                        "priceName": price_name,
                         "price": formatted_price,
                         "interval": interval,
                         "frequency": frequency,
                         "description": price_description,
                         "isRecommended": is_recommended,
                         "currency": currency,
-                        "rawAmount": amount,  # Keep raw amount for calculations
-                        "type": product_type,  # "subscription" or "credits"
+                        "rawAmount": amount,
+                        "type": product_type,
                     }
                     
-                    # Add credit-specific fields if applicable
+                    # Add credit-specific fields
                     if product_type == "credits":
                         plan_data["credits"] = credits
                         plan_data["isPopular"] = is_popular
@@ -316,7 +298,7 @@ async def get_products():
                     subscription_plans.append(plan_data)
                     
             except Exception as e:
-                print(f"Warning: Could not fetch prices for product {prod_id}: {e}")
+                print(f"⚠️  Could not fetch prices for product {prod_id}: {e}")
                 continue
         
         # Sort: recommended first, then by name
@@ -331,10 +313,10 @@ async def get_products():
         return {"success": True, "data": subscription_plans}
         
     except ApiError as e:
-        print(f"Paddle API error: {e}")
+        print(f"❌ Paddle API error: {e}")
         raise HTTPException(status_code=502, detail=f"Paddle API error: {str(e)}")
     except Exception as e:
-        print(f"Internal error: {e}")
+        print(f"❌ Internal error: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
