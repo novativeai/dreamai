@@ -207,7 +207,7 @@ async def get_products():
             if prod_status != "active" or not prod_id:
                 continue
             
-            # ✅ FIX: Handle nested custom_data
+            # Handle nested custom_data
             def safe_dict(obj):
                 if obj is None:
                     return {}
@@ -219,21 +219,12 @@ async def get_products():
                     return getattr(obj, '__dict__', {})
             
             custom_data_raw = safe_dict(getattr(product, "custom_data", None))
-            
-            # ✅ CRITICAL: Extract nested 'data' key
             custom_data = custom_data_raw.get('data', custom_data_raw)
             
-            print(f"📦 {prod_name}: custom_data = {custom_data}")
-            
-            # Determine product type
-            product_type = custom_data.get("type", custom_data.get("planType", "subscription"))
-            
-            # ✅ Filter prices for this product
+            # Filter prices for this product
             product_prices = [p for p in all_prices if getattr(p, "product_id", None) == prod_id]
-            print(f"   Found {len(product_prices)} prices")
             
             if len(product_prices) == 0:
-                print(f"   ⚠️ No prices for {prod_name}, skipping")
                 continue
             
             for price in product_prices:
@@ -246,14 +237,30 @@ async def get_products():
                 # Extract unit price
                 unit_price = getattr(price, "unit_price", None)
                 amount = getattr(unit_price, "amount", "0") if unit_price else "0"
-                currency = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
+                
+                # ✅ FIX: Extract string value from currency enum
+                currency_obj = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
+                if hasattr(currency_obj, 'value'):
+                    currency = currency_obj.value
+                elif isinstance(currency_obj, str):
+                    currency = currency_obj
+                else:
+                    currency = str(currency_obj)
                 
                 # Extract billing cycle
                 billing_cycle = getattr(price, "billing_cycle", None)
                 interval = None
                 frequency = None
                 if billing_cycle:
-                    interval = getattr(billing_cycle, "interval", None)
+                    # ✅ FIX: Extract string value from interval enum
+                    interval_obj = getattr(billing_cycle, "interval", None)
+                    if hasattr(interval_obj, 'value'):
+                        interval = interval_obj.value
+                    elif isinstance(interval_obj, str):
+                        interval = interval_obj
+                    else:
+                        interval = str(interval_obj) if interval_obj else None
+                    
                     frequency = getattr(billing_cycle, "frequency", 1)
                 
                 # Format price
@@ -265,17 +272,22 @@ async def get_products():
                 price_name = getattr(price, "name", None) or prod_name
                 price_description = getattr(price, "description", None) or prod_description
                 
-                # Handle price custom_data (also might be nested)
+                # Handle price custom_data
                 price_custom_data_raw = safe_dict(getattr(price, "custom_data", None))
                 price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
                 
-                # Check if recommended
-                is_recommended = (
+                # ✅ FIX: Convert isRecommended to boolean
+                is_recommended_raw = (
                     custom_data.get("isRecommended", False) or 
                     price_custom_data.get("isRecommended", False)
                 )
+                # Handle string "true"/"false" values
+                if isinstance(is_recommended_raw, str):
+                    is_recommended = is_recommended_raw.lower() == "true"
+                else:
+                    is_recommended = bool(is_recommended_raw)
                 
-                # Detect if subscription (has billing interval)
+                # Detect if subscription
                 is_subscription = interval is not None
                 
                 # Build response
@@ -285,11 +297,11 @@ async def get_products():
                     "name": prod_name,
                     "priceName": price_name,
                     "price": formatted_price,
-                    "interval": interval,
+                    "interval": interval,  # Now a string like "month"
                     "frequency": frequency,
                     "description": price_description,
-                    "isRecommended": is_recommended,
-                    "currency": currency,
+                    "isRecommended": is_recommended,  # Now a boolean
+                    "currency": currency,  # Now a string like "USD"
                     "rawAmount": amount,
                 }
                 
@@ -304,7 +316,6 @@ async def get_products():
                     plan_data["type"] = "subscription"
                 
                 subscription_plans.append(plan_data)
-                print(f"   ✅ Added: {price_name} ({price_id})")
         
         # Sort: recommended first, then by name
         subscription_plans.sort(
