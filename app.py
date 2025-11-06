@@ -445,8 +445,9 @@ async def get_products(status: str = Query("active", description="Filter by prod
     Enhanced for frontend compatibility with proper sorting and filtering.
     """
     try:
-        params = {"status": status, "include": "prices"}
-        product_iter = paddle.products.list(params=params)
+        # Pass parameters directly as kwargs in paddle-python-sdk 1.11.0+
+        # Use include_prices=True for including price data
+        product_iter = paddle.products.list(status=status, include_prices=True)
 
         serialized_products = []
         for p in product_iter:
@@ -454,16 +455,71 @@ async def get_products(status: str = Query("active", description="Filter by prod
             # Ensure custom_data exists for frontend filtering
             if not serialized.get("custom_data"):
                 serialized["custom_data"] = {}
-            serialized_products.append(serialized)
 
-        # Sort by custom_data.isRecommended for frontend display
+            # Transform to frontend-compatible format
+            custom_data = serialized.get("custom_data", {})
+
+            # Extract type from custom_data (required by frontend)
+            product_type = custom_data.get("type")
+            if not product_type:
+                # Skip products without a type
+                print(f"WARNING: Product {serialized.get('id')} missing type in custom_data, skipping")
+                continue
+
+            # Format price from prices array
+            prices = serialized.get("prices", [])
+            formatted_price = "$0.00"
+            interval = None
+            price_id = None
+
+            if prices and len(prices) > 0:
+                first_price = prices[0]
+                amount = first_price.get("amount")
+                currency = first_price.get("currency", "USD")
+                price_id = first_price.get("id")
+
+                # Format price (amount is in cents for USD)
+                if amount:
+                    if currency == "USD":
+                        formatted_price = f"${float(amount) / 100:.2f}"
+                    else:
+                        formatted_price = f"{float(amount) / 100:.2f} {currency}"
+
+                # Extract interval for subscriptions
+                billing_cycle = first_price.get("billing_cycle")
+                if billing_cycle:
+                    interval_value = billing_cycle.get("interval")
+                    if interval_value:
+                        interval = interval_value
+
+            # Build frontend-compatible object
+            frontend_item = {
+                "type": product_type,
+                "id": price_id or serialized.get("id"),  # Use price_id for checkout
+                "name": serialized.get("name"),
+                "description": serialized.get("description", ""),
+                "price": formatted_price,
+            }
+
+            # Add type-specific fields
+            if product_type == "subscription":
+                frontend_item["interval"] = interval
+                frontend_item["isRecommended"] = custom_data.get("isRecommended", False)
+            elif product_type == "credits":
+                frontend_item["credits"] = custom_data.get("credits", 0)
+                frontend_item["isPopular"] = custom_data.get("isPopular", False)
+
+            serialized_products.append(frontend_item)
+
+        # Sort by isRecommended/isPopular for frontend display
         serialized_products.sort(
             key=lambda x: (
-                x.get("custom_data", {}).get("isRecommended") is not True,
+                x.get("isRecommended") is not True and x.get("isPopular") is not True,
                 x.get("name", "")
             )
         )
 
+        print(f"✓ Returning {len(serialized_products)} products for frontend")
         return {"success": True, "data": serialized_products}
 
     except ApiError as e:
@@ -472,6 +528,8 @@ async def get_products(status: str = Query("active", description="Filter by prod
         raise HTTPException(status_code=502, detail=f"Paddle API error: {detail}")
     except Exception as e:
         print(f"Internal error in /products: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
 
 
