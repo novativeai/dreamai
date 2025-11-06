@@ -11,7 +11,7 @@ fastapi-cors==0.0.6
 fal-client==0.4.1
 
 # Paddle payment integration
-paddle-python-sdk==0.9.0
+paddle-python-sdk==1.11.0
 
 # Firebase Admin SDK
 firebase-admin==6.2.0
