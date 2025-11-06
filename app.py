@@ -38,6 +38,9 @@ from firebase_admin import credentials, firestore
 
 load_dotenv()
 
+# Load PADDLE_ENVIRONMENT early for CORS configuration
+PADDLE_ENVIRONMENT = os.environ.get("PADDLE_ENVIRONMENT", "sandbox").lower()
+
 app = FastAPI(title="DreamAI API")
 
 # Configure CORS based on environment
@@ -99,7 +102,7 @@ fal_client.api_key = os.environ.get("FAL_AI_KEY")
 
 # --- PADDLE CLIENT INIT ---
 PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY")
-PADDLE_ENVIRONMENT = os.environ.get("PADDLE_ENVIRONMENT", "sandbox").lower()
+# PADDLE_ENVIRONMENT already loaded at the top for CORS configuration
 
 # Initialize Paddle client with appropriate environment
 if PADDLE_ENVIRONMENT == "production":
