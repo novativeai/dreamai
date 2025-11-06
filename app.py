@@ -11,6 +11,9 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
+import requests
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
 
 # --- NEW FAL AI IMPORT ---
 import fal_client
@@ -109,6 +112,98 @@ except (ValueError, TypeError, json.JSONDecodeError) as e:
 
 
 # =================================================================================
+# === WATERMARK UTILITY FUNCTION ==================================================
+# =================================================================================
+def add_watermark(image_bytes: bytes, watermark_text: str = "DreamAI") -> bytes:
+    """
+    Add a watermark to an image in the bottom right corner.
+
+    Args:
+        image_bytes: The original image as bytes
+        watermark_text: The text to use as watermark (default: "DreamAI")
+
+    Returns:
+        The watermarked image as bytes (JPEG format)
+    """
+    try:
+        # Open the image from bytes
+        img = Image.open(BytesIO(image_bytes))
+
+        # Calculate font size based on image dimensions (2% of image height)
+        img_width, img_height = img.size
+        font_size = max(int(img_height * 0.02), 12)  # Minimum 12px
+
+        # Try to use a nice font, fall back to default if not available
+        try:
+            # Common font paths across different systems
+            font_paths = [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux
+                "/System/Library/Fonts/Helvetica.ttc",  # macOS
+                "C:\\Windows\\Fonts\\arial.ttf",  # Windows
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",  # Linux alternative
+            ]
+            font = None
+            for font_path in font_paths:
+                if os.path.exists(font_path):
+                    font = ImageFont.truetype(font_path, font_size)
+                    break
+
+            if font is None:
+                font = ImageFont.load_default()
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Create a semi-transparent overlay for the watermark background
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+
+        # Get text bounding box
+        bbox = overlay_draw.textbbox((0, 0), watermark_text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        # Calculate position (bottom right with padding)
+        padding = int(img_height * 0.015)  # 1.5% padding
+        bg_padding = 5
+        x = img_width - text_width - padding
+        y = img_height - text_height - padding
+
+        # Draw semi-transparent black rectangle on overlay
+        bg_bbox = (
+            x - bg_padding,
+            y - bg_padding,
+            x + text_width + bg_padding,
+            y + text_height + bg_padding
+        )
+        overlay_draw.rectangle(bg_bbox, fill=(0, 0, 0, 180))  # Semi-transparent black
+
+        # Draw white text on overlay
+        overlay_draw.text((x, y), watermark_text, fill=(255, 255, 255, 255), font=font)
+
+        # Convert base image to RGBA for compositing
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+
+        # Composite the overlay onto the image
+        img = Image.alpha_composite(img, overlay)
+
+        # Convert back to RGB for JPEG output
+        img = img.convert('RGB')
+
+        # Save to bytes
+        output_buffer = BytesIO()
+        img.save(output_buffer, format='JPEG', quality=95)
+        output_buffer.seek(0)
+
+        return output_buffer.read()
+
+    except Exception as e:
+        print(f"Error adding watermark: {e}")
+        # Return original image if watermarking fails
+        return image_bytes
+
+
+# =================================================================================
 # === REFACTORED /generate/ ENDPOINT FOR FAL AI ===================================
 # =================================================================================
 @app.post("/generate/")
@@ -122,53 +217,88 @@ async def generate_image(
     top_k: int = Form(40),         # top_k is not a direct param for FLUX
 ):
     """
-    Generate an image using Fal AI's FLUX model based on ONE input image and a prompt.
+    Generate an image using Fal AI's FLUX Kontext model based on ONE input image and a prompt.
     This endpoint maintains the original payload structure for frontend compatibility.
+    Downloads the generated image from fal.ai URL and adds "DreamAI" watermark.
     """
     # Ensure an image was actually sent
     if not image1 or not image1.file:
         raise HTTPException(status_code=400, detail="An image file is required.")
 
     try:
-        # Read the image bytes directly from the upload stream into memory.
+        # Read the image bytes
         image_bytes = await image1.read()
-        
-        # Ensure the file type is one Fal AI can handle
+
+        # Validate file type
         allowed_types = ["image/jpeg", "image/png", "image/webp"]
         if image1.content_type not in allowed_types:
             raise HTTPException(
-                status_code=415, 
+                status_code=415,
                 detail=f"Unsupported image type: {image1.content_type}. Please use JPEG, PNG, or WebP."
             )
 
-        # Call the Fal AI model using fal_client.run for a direct response
+        print(f"📤 Uploading image to fal.ai storage...")
+        # Upload the image to fal.ai storage and get a URL
+        uploaded_image_url = fal_client.upload(image_bytes, "image/jpeg")
+        print(f"✅ Image uploaded: {uploaded_image_url}")
+
+        print(f"🎨 Generating image with prompt: {prompt[:50]}...")
+        # Call the Fal AI FLUX Kontext model with image_url parameter
         result = fal_client.run(
             "fal-ai/flux-pro/kontext",
             arguments={
                 "prompt": prompt,
-                "image": fal_client.Image.from_bytes(image_bytes, format=image1.content_type.split('/')[1]),
-                # Default values for FLUX can be set here
+                "image_url": uploaded_image_url,
                 "guidance_scale": 3.5,
+                "num_inference_steps": 28,
                 "num_images": 1,
                 "output_format": "jpeg",
+                "image_prompt_strength": 0.1,
             },
         )
 
+        print(f"✅ Fal.ai response received: {type(result)}")
+
         # Process the response from Fal AI
+        # Fal.ai returns: {"images": [{"url": "https://..."}]}
         if not result or "images" not in result or len(result["images"]) == 0:
             raise HTTPException(status_code=500, detail="No image was generated by the model.")
-        
-        generated_image = result["images"][0]
-        image_content_bytes = generated_image["content"]
-        image_media_type = generated_image["content_type"]
 
-        return Response(content=image_content_bytes, media_type=image_media_type)
+        generated_image = result["images"][0]
+
+        # Check if we got a URL (typical fal.ai response) or direct content
+        if "url" in generated_image:
+            image_url = generated_image["url"]
+            print(f"📥 Downloading generated image from: {image_url}")
+
+            # Download the image from the URL
+            img_response = requests.get(image_url, timeout=30)
+            img_response.raise_for_status()
+            image_content_bytes = img_response.content
+        elif "content" in generated_image:
+            # Direct content (less common)
+            image_content_bytes = generated_image["content"]
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected response format from image generation service."
+            )
+
+        # Add watermark to the generated image
+        print("🏷️  Adding DreamAI watermark...")
+        watermarked_image_bytes = add_watermark(image_content_bytes, "DreamAI")
+
+        print(f"✅ Returning watermarked image ({len(watermarked_image_bytes)} bytes)")
+        return Response(content=watermarked_image_bytes, media_type="image/jpeg")
 
     except fal_client.FALServerException as e:
-        print(f"Fal AI Server Error: {e}")
+        print(f"❌ Fal AI Server Error: {e}")
         raise HTTPException(status_code=503, detail=f"The image generation service failed: {e}")
+    except requests.RequestException as e:
+        print(f"❌ Error downloading image: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download generated image.")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"❌ An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="An internal server error occurred.")
@@ -176,168 +306,6 @@ async def generate_image(
 # === END OF REFACTORED ENDPOINT ==================================================
 # =================================================================================
 
-
-# ---------------------------
-# Helper: serialize product object from SDK or dict
-# ---------------------------
-
-@app.get("/products")
-async def get_products():
-    """
-    Fetch products from Paddle and transform them for frontend consumption.
-    """
-    try:
-        print("🔍 Fetching all products and prices...")
-        
-        # Fetch all products and prices once
-        all_products = list(paddle.products.list())
-        all_prices = list(paddle.prices.list())
-        
-        print(f"✅ Found {len(all_products)} products and {len(all_prices)} prices")
-        
-        subscription_plans = []
-        
-        for product in all_products:
-            prod_id = getattr(product, "id", None)
-            prod_name = getattr(product, "name", "")
-            prod_description = getattr(product, "description", "")
-            prod_status = getattr(product, "status", "active")
-            
-            # Skip archived products
-            if prod_status != "active" or not prod_id:
-                continue
-            
-            # Handle nested custom_data
-            def safe_dict(obj):
-                if obj is None:
-                    return {}
-                if isinstance(obj, dict):
-                    return obj
-                try:
-                    return vars(obj)
-                except TypeError:
-                    return getattr(obj, '__dict__', {})
-            
-            custom_data_raw = safe_dict(getattr(product, "custom_data", None))
-            custom_data = custom_data_raw.get('data', custom_data_raw)
-            
-            # Filter prices for this product
-            product_prices = [p for p in all_prices if getattr(p, "product_id", None) == prod_id]
-            
-            if len(product_prices) == 0:
-                continue
-            
-            for price in product_prices:
-                price_id = getattr(price, "id", None)
-                price_status = getattr(price, "status", "active")
-                
-                if price_status != "active" or not price_id:
-                    continue
-                
-                # Extract unit price
-                unit_price = getattr(price, "unit_price", None)
-                amount = getattr(unit_price, "amount", "0") if unit_price else "0"
-                
-                # ✅ FIX: Extract string value from currency enum
-                currency_obj = getattr(unit_price, "currency_code", "USD") if unit_price else "USD"
-                if hasattr(currency_obj, 'value'):
-                    currency = currency_obj.value
-                elif isinstance(currency_obj, str):
-                    currency = currency_obj
-                else:
-                    currency = str(currency_obj)
-                
-                # Extract billing cycle
-                billing_cycle = getattr(price, "billing_cycle", None)
-                interval = None
-                frequency = None
-                if billing_cycle:
-                    # ✅ FIX: Extract string value from interval enum
-                    interval_obj = getattr(billing_cycle, "interval", None)
-                    if hasattr(interval_obj, 'value'):
-                        interval = interval_obj.value
-                    elif isinstance(interval_obj, str):
-                        interval = interval_obj
-                    else:
-                        interval = str(interval_obj) if interval_obj else None
-                    
-                    frequency = getattr(billing_cycle, "frequency", 1)
-                
-                # Format price
-                price_amount = float(amount) / 100
-                currency_symbol = "$" if currency == "USD" else currency
-                formatted_price = f"{currency_symbol}{price_amount:.2f}"
-                
-                # Get names
-                price_name = getattr(price, "name", None) or prod_name
-                price_description = getattr(price, "description", None) or prod_description
-                
-                # Handle price custom_data
-                price_custom_data_raw = safe_dict(getattr(price, "custom_data", None))
-                price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
-                
-                # ✅ FIX: Convert isRecommended to boolean
-                is_recommended_raw = (
-                    custom_data.get("isRecommended", False) or 
-                    price_custom_data.get("isRecommended", False)
-                )
-                # Handle string "true"/"false" values
-                if isinstance(is_recommended_raw, str):
-                    is_recommended = is_recommended_raw.lower() == "true"
-                else:
-                    is_recommended = bool(is_recommended_raw)
-                
-                # Detect if subscription
-                is_subscription = interval is not None
-                
-                # Build response
-                plan_data = {
-                    "id": price_id,
-                    "productId": prod_id,
-                    "name": prod_name,
-                    "priceName": price_name,
-                    "price": formatted_price,
-                    "interval": interval,  # Now a string like "month"
-                    "frequency": frequency,
-                    "description": price_description,
-                    "isRecommended": is_recommended,  # Now a boolean
-                    "currency": currency,  # Now a string like "USD"
-                    "rawAmount": amount,
-                }
-                
-                # Add type-specific fields
-                if not is_subscription:
-                    # Credit package
-                    plan_data["type"] = "credits"
-                    plan_data["credits"] = int(custom_data.get("amount", 0))
-                    plan_data["isPopular"] = custom_data.get("isPopular", False)
-                else:
-                    # Subscription
-                    plan_data["type"] = "subscription"
-                
-                subscription_plans.append(plan_data)
-        
-        # Sort: recommended first, then by name
-        subscription_plans.sort(
-            key=lambda x: (
-                x.get("isRecommended") is not True,
-                x.get("name", ""),
-                x.get("interval", "") or "",
-            )
-        )
-        
-        print(f"✅ Returning {len(subscription_plans)} plans")
-        return {"success": True, "data": subscription_plans}
-        
-    except ApiError as e:
-        print(f"❌ Paddle API error: {e}")
-        raise HTTPException(status_code=502, detail=f"Paddle API error: {str(e)}")
-    except Exception as e:
-        print(f"❌ Internal error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-        
 
 @app.post("/create-checkout")
 async def create_checkout(request: Request):
