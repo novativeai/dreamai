@@ -135,9 +135,9 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
         # Open the image from bytes
         img = Image.open(BytesIO(image_bytes))
 
-        # Calculate font size based on image dimensions (8% of image height - much bigger)
+        # Calculate font size based on image dimensions (80% of image height - 10x bigger)
         img_width, img_height = img.size
-        font_size = max(int(img_height * 0.08), 40)  # Minimum 40px, 8% of height
+        font_size = max(int(img_height * 0.8), 400)  # Minimum 400px, 80% of height
 
         # Try to use a nice font, fall back to default if not available
         try:
