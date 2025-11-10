@@ -114,24 +114,30 @@ except (ValueError, TypeError, json.JSONDecodeError) as e:
 # =================================================================================
 # === WATERMARK UTILITY FUNCTION ==================================================
 # =================================================================================
-def add_watermark(image_bytes: bytes, watermark_text: str = "DreamAI") -> bytes:
+def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: str = "DreamAI") -> bytes:
     """
     Add a watermark to an image in the bottom right corner.
+    Only adds watermark for non-premium users.
 
     Args:
         image_bytes: The original image as bytes
+        is_premium: If True, no watermark is added
         watermark_text: The text to use as watermark (default: "DreamAI")
 
     Returns:
         The watermarked image as bytes (JPEG format)
     """
+    # Premium users get no watermark
+    if is_premium:
+        return image_bytes
+
     try:
         # Open the image from bytes
         img = Image.open(BytesIO(image_bytes))
 
-        # Calculate font size based on image dimensions (2% of image height)
+        # Calculate font size based on image dimensions (8% of image height - much bigger)
         img_width, img_height = img.size
-        font_size = max(int(img_height * 0.02), 12)  # Minimum 12px
+        font_size = max(int(img_height * 0.08), 40)  # Minimum 40px, 8% of height
 
         # Try to use a nice font, fall back to default if not available
         try:
@@ -153,7 +159,7 @@ def add_watermark(image_bytes: bytes, watermark_text: str = "DreamAI") -> bytes:
         except Exception:
             font = ImageFont.load_default()
 
-        # Create a semi-transparent overlay for the watermark background
+        # Create a transparent overlay for the watermark
         overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
 
@@ -163,22 +169,13 @@ def add_watermark(image_bytes: bytes, watermark_text: str = "DreamAI") -> bytes:
         text_height = bbox[3] - bbox[1]
 
         # Calculate position (bottom right with padding)
-        padding = int(img_height * 0.015)  # 1.5% padding
-        bg_padding = 5
+        padding = int(img_height * 0.03)  # 3% padding
         x = img_width - text_width - padding
         y = img_height - text_height - padding
 
-        # Draw semi-transparent black rectangle on overlay
-        bg_bbox = (
-            x - bg_padding,
-            y - bg_padding,
-            x + text_width + bg_padding,
-            y + text_height + bg_padding
-        )
-        overlay_draw.rectangle(bg_bbox, fill=(0, 0, 0, 180))  # Semi-transparent black
-
-        # Draw white text on overlay
-        overlay_draw.text((x, y), watermark_text, fill=(255, 255, 255, 255), font=font)
+        # Draw white text with semi-transparent background (NO black box)
+        # Text is white with 220 alpha (slightly transparent)
+        overlay_draw.text((x, y), watermark_text, fill=(255, 255, 255, 220), font=font)
 
         # Convert base image to RGBA for compositing
         if img.mode != 'RGBA':
@@ -209,6 +206,7 @@ def add_watermark(image_bytes: bytes, watermark_text: str = "DreamAI") -> bytes:
 @app.post("/generate/")
 async def generate_image(
     image1: UploadFile = File(...),
+    userId: str = Form(...),  # Required for credit deduction
     # The payload can still contain these, but we will ignore them
     image2: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
@@ -220,10 +218,48 @@ async def generate_image(
     Generate an image using Fal AI's FLUX Kontext model based on ONE input image and a prompt.
     This endpoint maintains the original payload structure for frontend compatibility.
     Downloads the generated image from fal.ai URL and adds "DreamAI" watermark.
+    Deducts 1 credit from non-premium users.
     """
     # Ensure an image was actually sent
     if not image1 or not image1.file:
         raise HTTPException(status_code=400, detail="An image file is required.")
+
+    if not userId:
+        raise HTTPException(status_code=400, detail="userId is required for credit tracking.")
+
+    # Check user's premium status and credits
+    try:
+        user_doc = db.collection('users').document(userId).get()
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_data = user_doc.to_dict()
+        premium_status = user_data.get('premium_status')
+        is_premium = premium_status == 'active'
+        current_credits = user_data.get('credits', 0)
+
+        # If not premium, check and deduct credits
+        if not is_premium:
+            if current_credits < 1:
+                raise HTTPException(
+                    status_code=402,  # Payment Required
+                    detail="Insufficient credits. Please purchase more credits or upgrade to premium."
+                )
+
+            # Deduct 1 credit BEFORE generation
+            user_ref = db.collection('users').document(userId)
+            user_ref.update({
+                "credits": firestore.Increment(-1)
+            })
+            print(f"💳 Deducted 1 credit from user {userId}. Remaining: {current_credits - 1}")
+        else:
+            print(f"👑 Premium user {userId} - no credit deduction")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error checking user credits: {e}")
+        raise HTTPException(status_code=500, detail="Failed to verify user credits")
 
     try:
         # Read the image bytes
@@ -243,17 +279,17 @@ async def generate_image(
         print(f"✅ Image uploaded: {uploaded_image_url}")
 
         print(f"🎨 Generating image with prompt: {prompt[:50]}...")
-        # Call the Fal AI FLUX Kontext model with image_url parameter
+        # Call the Fal AI FLUX Kontext [pro] model with image_url parameter
+        # Official docs: https://fal.ai/models/fal-ai/flux-pro/kontext/api
         result = fal_client.run(
             "fal-ai/flux-pro/kontext",
             arguments={
                 "prompt": prompt,
                 "image_url": uploaded_image_url,
-                "guidance_scale": 3.5,
-                "num_inference_steps": 28,
-                "num_images": 1,
-                "output_format": "jpeg",
-                "image_prompt_strength": 0.1,
+                "guidance_scale": 3.5,  # CFG scale (1-20, default: 3.5)
+                "num_inference_steps": 28,  # Generation iterations (1-50, default: 28)
+                "num_images": 1,  # Number of images to generate (1-4)
+                "output_format": "jpeg",  # Output format: "jpeg" or "png"
             },
         )
 
@@ -284,11 +320,15 @@ async def generate_image(
                 detail="Unexpected response format from image generation service."
             )
 
-        # Add watermark to the generated image
-        print("🏷️  Adding DreamAI watermark...")
-        watermarked_image_bytes = add_watermark(image_content_bytes, "DreamAI")
+        # Add watermark to the generated image (only for non-premium users)
+        if is_premium:
+            print("👑 Premium user - no watermark")
+            watermarked_image_bytes = image_content_bytes
+        else:
+            print("🏷️  Adding DreamAI watermark...")
+            watermarked_image_bytes = add_watermark(image_content_bytes, is_premium, "DreamAI")
 
-        print(f"✅ Returning watermarked image ({len(watermarked_image_bytes)} bytes)")
+        print(f"✅ Returning image ({len(watermarked_image_bytes)} bytes)")
         return Response(content=watermarked_image_bytes, media_type="image/jpeg")
 
     except fal_client.FALServerException as e:
@@ -593,6 +633,243 @@ async def get_subscription_status(user_id: str):
     except Exception as e:
         print(f"Error fetching subscription status: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch subscription status")
+
+
+@app.post("/paddle-webhook")
+async def paddle_webhook(request: Request):
+    """
+    Handle Paddle webhook notifications.
+    Updates user subscription status and credits in Firestore.
+
+    Events handled:
+    - subscription.created: Activates premium subscription
+    - subscription.updated: Updates subscription status
+    - subscription.canceled: Removes premium status
+    - transaction.completed: Adds credits for one-time purchases
+    """
+    try:
+        # Get webhook secret from environment
+        webhook_secret = os.environ.get("PADDLE_WEBHOOK_SECRET")
+
+        if not webhook_secret:
+            print("❌ PADDLE_WEBHOOK_SECRET not configured")
+            raise HTTPException(status_code=500, detail="Webhook secret not configured")
+
+        # Verify webhook signature
+        print("🔐 Verifying webhook signature...")
+        integrity_check = Verifier().verify(request, Secret(webhook_secret))
+
+        if not integrity_check:
+            print("❌ Webhook signature verification failed")
+            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+        print("✅ Webhook signature verified")
+
+        # Parse webhook body
+        body = await request.json()
+        event_type = body.get("event_type")
+        data = body.get("data", {})
+
+        print(f"📥 Webhook received: {event_type}")
+        print(f"📦 Data: {json.dumps(data, indent=2)}")
+
+        # Extract custom_data to get Firebase UID (available in most events)
+        custom_data = data.get("custom_data", {})
+        firebase_uid = custom_data.get("firebase_uid")
+
+        if not firebase_uid:
+            print("⚠️ No firebase_uid in custom_data, checking transaction items...")
+            # For some events, custom_data might be nested in items
+            items = data.get("items", [])
+            for item in items:
+                item_custom_data = item.get("custom_data", {})
+                if item_custom_data.get("firebase_uid"):
+                    firebase_uid = item_custom_data.get("firebase_uid")
+                    break
+
+        if not firebase_uid:
+            print("⚠️ Warning: No firebase_uid found in webhook data")
+            return {"status": "ok", "message": "No firebase_uid to process"}
+
+        # Handle subscription.created
+        if event_type == "subscription.created":
+            subscription_id = data.get("id")
+            customer_id = data.get("customer_id")
+            status = data.get("status")
+
+            print(f"🎉 Creating subscription for user {firebase_uid}")
+
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update({
+                "subscription_id": subscription_id,
+                "paddle_customer_id": customer_id,
+                "subscription_status": status,
+                "premium_status": "active" if status == "active" else None,
+                "subscription_created_at": firestore.SERVER_TIMESTAMP,
+            })
+
+            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id}")
+
+        # Handle subscription.updated
+        elif event_type == "subscription.updated":
+            subscription_id = data.get("id")
+            status = data.get("status")
+            scheduled_change = data.get("scheduled_change")
+
+            print(f"🔄 Updating subscription for user {firebase_uid}: {status}")
+
+            update_data = {
+                "subscription_status": status,
+                "subscription_updated_at": firestore.SERVER_TIMESTAMP,
+            }
+
+            # Set premium_status based on subscription status
+            if status in ["active", "trialing"]:
+                update_data["premium_status"] = "active"
+            elif status in ["paused", "past_due"]:
+                update_data["premium_status"] = "paused"
+            elif status in ["canceled", "deleted"]:
+                update_data["premium_status"] = None
+
+            # Store scheduled change info if present
+            if scheduled_change:
+                update_data["scheduled_change"] = scheduled_change
+
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update(update_data)
+
+            print(f"✅ Updated subscription status for {firebase_uid}: {status}")
+
+        # Handle subscription.canceled
+        elif event_type == "subscription.canceled":
+            subscription_id = data.get("id")
+            canceled_at = data.get("canceled_at")
+
+            print(f"❌ Canceling subscription for user {firebase_uid}")
+
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update({
+                "subscription_status": "canceled",
+                "premium_status": None,
+                "subscription_canceled_at": canceled_at or firestore.SERVER_TIMESTAMP,
+            })
+
+            print(f"✅ Canceled subscription for {firebase_uid}")
+
+        # Handle subscription.paused
+        elif event_type == "subscription.paused":
+            subscription_id = data.get("id")
+            paused_at = data.get("paused_at")
+
+            print(f"⏸️ Pausing subscription for user {firebase_uid}")
+
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update({
+                "subscription_status": "paused",
+                "premium_status": "paused",
+                "subscription_paused_at": paused_at or firestore.SERVER_TIMESTAMP,
+            })
+
+            print(f"✅ Paused subscription for {firebase_uid}")
+
+        # Handle subscription.resumed
+        elif event_type == "subscription.resumed":
+            subscription_id = data.get("id")
+            status = data.get("status")
+
+            print(f"▶️ Resuming subscription for user {firebase_uid}")
+
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update({
+                "subscription_status": status,
+                "premium_status": "active",
+                "subscription_resumed_at": firestore.SERVER_TIMESTAMP,
+            })
+
+            print(f"✅ Resumed subscription for {firebase_uid}")
+
+        # Handle transaction.completed (for credit purchases and subscription payments)
+        elif event_type == "transaction.completed":
+            transaction_id = data.get("id")
+            items = data.get("items", [])
+            status = data.get("status")
+
+            print(f"💳 Transaction completed for user {firebase_uid}: {transaction_id}")
+
+            # Process each item in the transaction
+            total_credits_added = 0
+
+            for item in items:
+                price = item.get("price", {})
+                product = price.get("product", {})
+
+                # Check if this is a credit package purchase
+                product_custom_data = product.get("custom_data", {})
+
+                # Extract credits amount
+                credits = 0
+                if isinstance(product_custom_data, dict):
+                    credits = product_custom_data.get("amount", 0)
+                    if not credits:
+                        credits = product_custom_data.get("credits", 0)
+
+                if credits and credits > 0:
+                    total_credits_added += int(credits)
+                    print(f"   💰 Found credit package: {credits} credits")
+
+            # Add credits to user if any were purchased
+            if total_credits_added > 0:
+                user_ref = db.collection('users').document(firebase_uid)
+
+                # Use Firestore increment to safely add credits
+                user_ref.update({
+                    "credits": firestore.Increment(total_credits_added)
+                })
+
+                print(f"✅ Added {total_credits_added} credits to user {firebase_uid}")
+
+                # Log transaction in user's history
+                user_ref.collection('transactions').document(transaction_id).set({
+                    "transaction_id": transaction_id,
+                    "type": "credit_purchase",
+                    "credits_added": total_credits_added,
+                    "status": status,
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                })
+            else:
+                print(f"   ℹ️ No credits found in transaction (likely subscription payment)")
+
+        # Handle transaction.paid (alternative event name in some cases)
+        elif event_type == "transaction.paid":
+            print(f"✅ Transaction paid event received for user {firebase_uid}")
+            # Similar logic to transaction.completed if needed
+            # Usually transaction.completed is sufficient
+
+        # Log unhandled events for monitoring
+        else:
+            print(f"ℹ️ Unhandled event type: {event_type}")
+            print(f"   Data: {json.dumps(data, indent=2)}")
+
+        return {
+            "status": "ok",
+            "event_type": event_type,
+            "processed": True
+        }
+
+    except HTTPException:
+        # Re-raise HTTP exceptions (signature failures, config errors)
+        raise
+
+    except ApiError as e:
+        error_msg = getattr(e, 'message', str(e))
+        print(f"❌ Paddle API error in webhook: {error_msg}")
+        raise HTTPException(status_code=500, detail=f"Paddle API error: {error_msg}")
+
+    except Exception as e:
+        print(f"❌ Webhook processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.get("/health")
