@@ -1,0 +1,2 @@
+# This file tells Railway to install dependencies from backend folder
+-r backend/requirements.txt
