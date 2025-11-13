@@ -43,6 +43,7 @@ app = FastAPI(title="DreamAI API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://dreamai-generator.vercel.app",  # Next.js production deployment
         "https://dreamai-checkpoint.netlify.app",
         "http://localhost:8081",
         "http://localhost:3000",
