@@ -184,17 +184,13 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
                 center_watermark = Image.open(center_watermark_path).convert('RGBA')
                 print(f"[WATERMARK DEBUG] Center watermark loaded: {center_watermark.size}")
 
-                # Scale watermark to be 70% of image width (increased for visibility)
-                scale_factor = (img_width * 0.7) / center_watermark.width
+                # Scale watermark to be 56% of image width (reduced by 20% from 70%)
+                scale_factor = (img_width * 0.56) / center_watermark.width
                 new_width = int(center_watermark.width * scale_factor)
                 new_height = int(center_watermark.height * scale_factor)
                 center_watermark = center_watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
                 print(f"[WATERMARK DEBUG] Center watermark resized to: {new_width}x{new_height}")
-
-                # Add dark stroke for visibility on any background
-                center_watermark = add_stroke_to_watermark(center_watermark, stroke_width=2)
-                print(f"[WATERMARK DEBUG] Center watermark stroke applied")
 
                 # Apply 40% opacity while preserving transparency
                 alpha = center_watermark.getchannel('A')
@@ -225,10 +221,6 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
             bottom_watermark = bottom_watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             print(f"[WATERMARK DEBUG] Bottom watermark resized to: {new_width}x{new_height}")
-
-            # Add dark stroke for visibility on any background
-            bottom_watermark = add_stroke_to_watermark(bottom_watermark, stroke_width=3)
-            print(f"[WATERMARK DEBUG] Bottom watermark stroke applied")
 
             # Bottom right position with padding
             padding = int(min(img_height, img_width) * 0.02)
