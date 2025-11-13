@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import requests
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # --- NEW FAL AI IMPORT ---
 import fal_client
@@ -113,8 +113,37 @@ except (ValueError, TypeError, json.JSONDecodeError) as e:
 
 
 # =================================================================================
-# === WATERMARK UTILITY FUNCTION ==================================================
+# === WATERMARK UTILITY FUNCTIONS =================================================
 # =================================================================================
+def add_stroke_to_watermark(watermark_rgba: Image.Image, stroke_width: int = 3) -> Image.Image:
+    """
+    Add a dark stroke/outline around a watermark to make it visible on any background.
+
+    Args:
+        watermark_rgba: The watermark image in RGBA mode
+        stroke_width: Width of the stroke in pixels (default: 3)
+
+    Returns:
+        Watermark with dark stroke applied
+    """
+    # Extract alpha channel
+    alpha = watermark_rgba.getchannel('A')
+
+    # Dilate the alpha channel to create stroke
+    stroke_alpha = alpha.copy()
+    for _ in range(stroke_width):
+        stroke_alpha = stroke_alpha.filter(ImageFilter.MaxFilter(3))
+
+    # Create black stroke layer
+    stroke = Image.new('RGBA', watermark_rgba.size, (0, 0, 0, 255))
+    stroke.putalpha(stroke_alpha)
+
+    # Composite: stroke (black background) behind watermark (white foreground)
+    result = Image.alpha_composite(stroke, watermark_rgba)
+
+    return result
+
+
 def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: str = "DreamAI") -> bytes:
     """
     Add watermark(s) to an image based on user's premium status.
@@ -163,6 +192,10 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
 
                 print(f"[WATERMARK DEBUG] Center watermark resized to: {new_width}x{new_height}")
 
+                # Add dark stroke for visibility on any background
+                center_watermark = add_stroke_to_watermark(center_watermark, stroke_width=2)
+                print(f"[WATERMARK DEBUG] Center watermark stroke applied")
+
                 # Apply 40% opacity while preserving transparency
                 alpha = center_watermark.getchannel('A')
                 alpha = alpha.point(lambda x: int(x * 0.4))
@@ -192,7 +225,10 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
             bottom_watermark = bottom_watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             print(f"[WATERMARK DEBUG] Bottom watermark resized to: {new_width}x{new_height}")
-            print(f"[WATERMARK DEBUG] Bottom watermark has alpha channel: {bottom_watermark.mode}")
+
+            # Add dark stroke for visibility on any background
+            bottom_watermark = add_stroke_to_watermark(bottom_watermark, stroke_width=3)
+            print(f"[WATERMARK DEBUG] Bottom watermark stroke applied")
 
             # Bottom right position with padding
             padding = int(min(img_height, img_width) * 0.02)
