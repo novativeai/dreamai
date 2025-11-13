@@ -153,17 +153,20 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
             try:
                 center_watermark_path = os.path.join(watermark_dir, "watermark-1.png")
                 center_watermark = Image.open(center_watermark_path).convert('RGBA')
+                print(f"[WATERMARK DEBUG] Center watermark loaded: {center_watermark.size}")
 
-                # Scale watermark to be 50% of image width
-                scale_factor = (img_width * 0.5) / center_watermark.width
+                # Scale watermark to be 70% of image width (increased for visibility)
+                scale_factor = (img_width * 0.7) / center_watermark.width
                 new_width = int(center_watermark.width * scale_factor)
                 new_height = int(center_watermark.height * scale_factor)
                 center_watermark = center_watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
                 print(f"[WATERMARK DEBUG] Center watermark resized to: {new_width}x{new_height}")
 
-                # Apply 40% opacity
-                center_watermark.putalpha(int(255 * 0.4))
+                # Apply 40% opacity while preserving transparency
+                alpha = center_watermark.getchannel('A')
+                alpha = alpha.point(lambda x: int(x * 0.4))
+                center_watermark.putalpha(alpha)
 
                 # Center position
                 center_x = (img_width - new_width) // 2
@@ -180,14 +183,16 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
         try:
             bottom_watermark_path = os.path.join(watermark_dir, "watermark-2.png")
             bottom_watermark = Image.open(bottom_watermark_path).convert('RGBA')
+            print(f"[WATERMARK DEBUG] Bottom watermark loaded: {bottom_watermark.size}")
 
-            # Scale watermark to be 30% of image width
-            scale_factor = (img_width * 0.3) / bottom_watermark.width
+            # Scale watermark to be 40% of image width (increased for visibility)
+            scale_factor = (img_width * 0.4) / bottom_watermark.width
             new_width = int(bottom_watermark.width * scale_factor)
             new_height = int(bottom_watermark.height * scale_factor)
             bottom_watermark = bottom_watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             print(f"[WATERMARK DEBUG] Bottom watermark resized to: {new_width}x{new_height}")
+            print(f"[WATERMARK DEBUG] Bottom watermark has alpha channel: {bottom_watermark.mode}")
 
             # Bottom right position with padding
             padding = int(min(img_height, img_width) * 0.02)
