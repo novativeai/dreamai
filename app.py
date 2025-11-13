@@ -165,6 +165,8 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
             center_font = None
             if not is_premium:
                 center_font_size = min(int(img_height * 0.6), int(img_width * 1.5), 1000)  # Max 60% height, 150% width, or 1000px
+                print(f"[WATERMARK DEBUG] Image size: {img_width}x{img_height}")
+                print(f"[WATERMARK DEBUG] Center font calc: min({int(img_height * 0.6)}, {int(img_width * 1.5)}, 1000) = {center_font_size}")
                 for font_path in font_paths:
                     if os.path.exists(font_path):
                         center_font = ImageFont.truetype(font_path, center_font_size)
@@ -174,6 +176,7 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
 
             # Small font for bottom right watermark
             bottom_font_size = min(int(img_height * 0.20), int(img_width * 0.4), 400)  # Max 20% height, 40% width, or 400px
+            print(f"[WATERMARK DEBUG] Bottom font calc: min({int(img_height * 0.20)}, {int(img_width * 0.4)}, 400) = {bottom_font_size}")
             bottom_font = None
             for font_path in font_paths:
                 if os.path.exists(font_path):
