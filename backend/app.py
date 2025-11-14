@@ -630,19 +630,33 @@ async def get_products():
                     plan_data["type"] = "credits"
 
                     # Try multiple field names for flexibility
+                    # Check both product-level and price-level custom_data
                     # Paddle custom data may use: amount, credit_amount, credits, or credit_count
                     credits = (
+                        # Try product custom_data first
                         custom_data.get("amount") or
                         custom_data.get("credit_amount") or
                         custom_data.get("credits") or
                         custom_data.get("credit_count") or
+                        # Then try price custom_data
+                        price_custom_data.get("amount") or
+                        price_custom_data.get("credit_amount") or
+                        price_custom_data.get("credits") or
+                        price_custom_data.get("credit_count") or
                         0
                     )
                     plan_data["credits"] = int(credits) if credits else 0
-                    plan_data["isPopular"] = custom_data.get("isPopular", False)
+
+                    # Check isPopular from both sources
+                    plan_data["isPopular"] = (
+                        custom_data.get("isPopular", False) or
+                        price_custom_data.get("isPopular", False)
+                    )
 
                     # Debug logging
-                    print(f"   💰 Credit package: {credits} credits from custom_data")
+                    print(f"   💰 Credit package: {credits} credits")
+                    print(f"      Product custom_data: {custom_data}")
+                    print(f"      Price custom_data: {price_custom_data}")
                 else:
                     # Subscription
                     plan_data["type"] = "subscription"
