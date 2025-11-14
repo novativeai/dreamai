@@ -589,29 +589,29 @@ async def get_products():
                 currency_symbol = "$" if currency == "USD" else currency
                 formatted_price = f"{currency_symbol}{price_amount:.2f}"
                 
-                # Get names
+                # Get names - use price name if available, fallback to product name
                 price_name = getattr(price, "name", None) or prod_name
                 price_description = getattr(price, "description", None) or prod_description
-                
+
                 # Handle price custom_data (also might be nested)
                 price_custom_data_raw = safe_dict(getattr(price, "custom_data", None))
                 price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
-                
+
                 # Check if recommended
                 is_recommended = (
-                    custom_data.get("isRecommended", False) or 
+                    custom_data.get("isRecommended", False) or
                     price_custom_data.get("isRecommended", False)
                 )
-                
+
                 # Detect if subscription (has billing interval)
                 is_subscription = interval is not None
-                
-                # Build response
+
+                # Build response - use price_name as the main name to show different price names
                 plan_data = {
                     "id": price_id,
                     "productId": prod_id,
-                    "name": prod_name,
-                    "priceName": price_name,
+                    "name": price_name,  # Use price name instead of product name
+                    "productName": prod_name,  # Keep product name for reference
                     "price": formatted_price,
                     "interval": interval,
                     "frequency": frequency,
