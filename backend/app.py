@@ -729,6 +729,13 @@ def verify_paddle_webhook_signature(paddle_signature: str, raw_body: str, webhoo
             print(f"❌ Signature timestamp too old: {time_diff} seconds difference")
             return False
 
+        # Debug logging
+        print(f"🔍 Debug Info:")
+        print(f"   Timestamp: {timestamp}")
+        print(f"   Body length: {len(raw_body)} bytes")
+        print(f"   Body preview: {raw_body[:200]}...")
+        print(f"   Webhook secret length: {len(webhook_secret)}")
+
         # Create payload: timestamp:body
         payload = f"{timestamp}:{raw_body}"
 
@@ -746,6 +753,7 @@ def verify_paddle_webhook_signature(paddle_signature: str, raw_body: str, webhoo
             print("❌ Signature mismatch")
             print(f"   Expected: {computed_signature}")
             print(f"   Received: {signature}")
+            print(f"   Payload format: ts={timestamp}:body({len(raw_body)} bytes)")
 
         return is_valid
 
