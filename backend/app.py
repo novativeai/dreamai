@@ -4,6 +4,9 @@ import json
 import os
 import mimetypes
 import uuid
+import hmac
+import hashlib
+import time
 from typing import Optional, List, Any, Dict
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Header, Response, Query
 from fastapi.responses import JSONResponse
@@ -687,8 +690,77 @@ async def get_subscription_status(user_id: str):
         raise HTTPException(status_code=500, detail="Failed to fetch subscription status")
 
 
+def verify_paddle_webhook_signature(paddle_signature: str, raw_body: str, webhook_secret: str) -> bool:
+    """
+    Manually verify Paddle webhook signature using HMAC-SHA256.
+
+    Paddle signature format: "ts=1234567890;h1=abc123..."
+
+    Args:
+        paddle_signature: Value from Paddle-Signature header
+        raw_body: Raw request body as string
+        webhook_secret: Webhook secret from Paddle dashboard
+
+    Returns:
+        True if signature is valid, False otherwise
+    """
+    try:
+        # Parse signature header to extract timestamp and signature
+        parts = paddle_signature.split(";")
+        timestamp = None
+        signature = None
+
+        for part in parts:
+            if part.startswith("ts="):
+                timestamp = part.split("=", 1)[1]
+            elif part.startswith("h1="):
+                signature = part.split("=", 1)[1]
+
+        if not timestamp or not signature:
+            print("❌ Invalid signature format: missing timestamp or signature")
+            return False
+
+        # Verify timestamp to prevent replay attacks (5 minutes tolerance)
+        current_time = int(time.time())
+        sig_time = int(timestamp)
+        time_diff = abs(current_time - sig_time)
+
+        if time_diff > 300:  # 5 minutes = 300 seconds
+            print(f"❌ Signature timestamp too old: {time_diff} seconds difference")
+            return False
+
+        # Create payload: timestamp:body
+        payload = f"{timestamp}:{raw_body}"
+
+        # Generate HMAC-SHA256 signature
+        computed_signature = hmac.new(
+            webhook_secret.encode('utf-8'),
+            msg=payload.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        # Compare signatures using constant-time comparison
+        is_valid = hmac.compare_digest(signature, computed_signature)
+
+        if not is_valid:
+            print("❌ Signature mismatch")
+            print(f"   Expected: {computed_signature}")
+            print(f"   Received: {signature}")
+
+        return is_valid
+
+    except Exception as e:
+        print(f"❌ Signature verification error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 @app.post("/paddle-webhook")
-async def paddle_webhook(request: Request):
+async def paddle_webhook(
+    request: Request,
+    paddle_signature: Optional[str] = Header(None, alias="Paddle-Signature")
+):
     """
     Handle Paddle webhook notifications.
     Updates user subscription status and credits in Firestore.
@@ -707,18 +779,28 @@ async def paddle_webhook(request: Request):
             print("❌ PADDLE_WEBHOOK_SECRET not configured")
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
-        # Verify webhook signature
-        print("🔐 Verifying webhook signature...")
-        integrity_check = Verifier().verify(request, Secret(webhook_secret))
+        # Get raw body bytes BEFORE parsing JSON (required for signature verification)
+        raw_body_bytes = await request.body()
+        raw_body_str = raw_body_bytes.decode('utf-8')
 
-        if not integrity_check:
+        # Verify webhook signature using manual HMAC verification
+        print("🔐 Verifying webhook signature...")
+
+        if not paddle_signature:
+            print("❌ Missing Paddle-Signature header")
+            raise HTTPException(status_code=400, detail="Missing webhook signature")
+
+        # Use our manual verification function (compatible with FastAPI)
+        is_valid = verify_paddle_webhook_signature(paddle_signature, raw_body_str, webhook_secret)
+
+        if not is_valid:
             print("❌ Webhook signature verification failed")
             raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
         print("✅ Webhook signature verified")
 
-        # Parse webhook body
-        body = await request.json()
+        # Parse webhook body from raw string
+        body = json.loads(raw_body_str)
         event_type = body.get("event_type")
         data = body.get("data", {})
 
