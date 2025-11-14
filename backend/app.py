@@ -868,16 +868,21 @@ async def paddle_webhook(
 
             print(f"🎉 Creating subscription for user {firebase_uid}")
 
+            # Determine if subscription grants premium access
+            is_premium = status in ["active", "trialing"]
+            premium_status = "active" if is_premium else None
+
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update({
                 "subscription_id": subscription_id,
                 "paddle_customer_id": customer_id,
                 "subscription_status": status,
-                "premium_status": "active" if status == "active" else None,
+                "isPremium": is_premium,
+                "premium_status": premium_status,
                 "subscription_created_at": firestore.SERVER_TIMESTAMP,
             })
 
-            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id}")
+            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id} (isPremium: {is_premium})")
 
         # Handle subscription.updated
         elif event_type == "subscription.updated":
@@ -892,12 +897,15 @@ async def paddle_webhook(
                 "subscription_updated_at": firestore.SERVER_TIMESTAMP,
             }
 
-            # Set premium_status based on subscription status
+            # Set isPremium and premium_status based on subscription status
             if status in ["active", "trialing"]:
+                update_data["isPremium"] = True
                 update_data["premium_status"] = "active"
             elif status in ["paused", "past_due"]:
+                update_data["isPremium"] = False
                 update_data["premium_status"] = "paused"
             elif status in ["canceled", "deleted"]:
+                update_data["isPremium"] = False
                 update_data["premium_status"] = None
 
             # Store scheduled change info if present
@@ -907,7 +915,7 @@ async def paddle_webhook(
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update(update_data)
 
-            print(f"✅ Updated subscription status for {firebase_uid}: {status}")
+            print(f"✅ Updated subscription status for {firebase_uid}: {status} (isPremium: {update_data.get('isPremium', False)})")
 
         # Handle subscription.canceled
         elif event_type == "subscription.canceled":
@@ -919,11 +927,12 @@ async def paddle_webhook(
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update({
                 "subscription_status": "canceled",
+                "isPremium": False,
                 "premium_status": None,
                 "subscription_canceled_at": canceled_at or firestore.SERVER_TIMESTAMP,
             })
 
-            print(f"✅ Canceled subscription for {firebase_uid}")
+            print(f"✅ Canceled subscription for {firebase_uid} (isPremium: False)")
 
         # Handle subscription.paused
         elif event_type == "subscription.paused":
@@ -935,11 +944,12 @@ async def paddle_webhook(
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update({
                 "subscription_status": "paused",
+                "isPremium": False,
                 "premium_status": "paused",
                 "subscription_paused_at": paused_at or firestore.SERVER_TIMESTAMP,
             })
 
-            print(f"✅ Paused subscription for {firebase_uid}")
+            print(f"✅ Paused subscription for {firebase_uid} (isPremium: False)")
 
         # Handle subscription.resumed
         elif event_type == "subscription.resumed":
@@ -951,11 +961,12 @@ async def paddle_webhook(
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update({
                 "subscription_status": status,
+                "isPremium": True,
                 "premium_status": "active",
                 "subscription_resumed_at": firestore.SERVER_TIMESTAMP,
             })
 
-            print(f"✅ Resumed subscription for {firebase_uid}")
+            print(f"✅ Resumed subscription for {firebase_uid} (isPremium: True)")
 
         # Handle transaction.completed (for credit purchases and subscription payments)
         elif event_type == "transaction.completed":
