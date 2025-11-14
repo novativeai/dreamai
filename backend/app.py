@@ -628,8 +628,21 @@ async def get_products():
                 if not is_subscription:
                     # Credit package
                     plan_data["type"] = "credits"
-                    plan_data["credits"] = int(custom_data.get("amount", 0))
+
+                    # Try multiple field names for flexibility
+                    # Paddle custom data may use: amount, credit_amount, credits, or credit_count
+                    credits = (
+                        custom_data.get("amount") or
+                        custom_data.get("credit_amount") or
+                        custom_data.get("credits") or
+                        custom_data.get("credit_count") or
+                        0
+                    )
+                    plan_data["credits"] = int(credits) if credits else 0
                     plan_data["isPopular"] = custom_data.get("isPopular", False)
+
+                    # Debug logging
+                    print(f"   💰 Credit package: {credits} credits from custom_data")
                 else:
                     # Subscription
                     plan_data["type"] = "subscription"
@@ -948,12 +961,19 @@ async def paddle_webhook(
                 # Check if this is a credit package purchase
                 product_custom_data = product.get("custom_data", {})
 
-                # Extract credits amount
+                # Debug: Log what we received
+                print(f"   🔍 Product custom_data: {product_custom_data}")
+
+                # Extract credits amount - try multiple field names for flexibility
                 credits = 0
                 if isinstance(product_custom_data, dict):
-                    credits = product_custom_data.get("amount", 0)
-                    if not credits:
-                        credits = product_custom_data.get("credits", 0)
+                    credits = (
+                        product_custom_data.get("amount") or
+                        product_custom_data.get("credit_amount") or
+                        product_custom_data.get("credits") or
+                        product_custom_data.get("credit_count") or
+                        0
+                    )
 
                 if credits and credits > 0:
                     total_credits_added += int(credits)
