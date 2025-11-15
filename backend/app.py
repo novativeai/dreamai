@@ -866,23 +866,35 @@ async def paddle_webhook(
             customer_id = data.get("customer_id")
             status = data.get("status")
 
-            print(f"🎉 Creating subscription for user {firebase_uid}")
+            # Extract price_id from subscription items
+            price_id = None
+            items = data.get("items", [])
+            if items and len(items) > 0:
+                price_id = items[0].get("price", {}).get("id") if isinstance(items[0].get("price"), dict) else items[0].get("price_id")
+
+            print(f"🎉 Creating subscription for user {firebase_uid} (price_id: {price_id})")
 
             # Determine if subscription grants premium access
             is_premium = status in ["active", "trialing"]
             premium_status = "active" if is_premium else None
 
             user_ref = db.collection('users').document(firebase_uid)
-            user_ref.update({
+            update_data = {
                 "subscription_id": subscription_id,
                 "paddle_customer_id": customer_id,
                 "subscription_status": status,
                 "isPremium": is_premium,
                 "premium_status": premium_status,
                 "subscription_created_at": firestore.SERVER_TIMESTAMP,
-            })
+            }
 
-            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id} (isPremium: {is_premium})")
+            # Add price_id if available
+            if price_id:
+                update_data["subscription_price_id"] = price_id
+
+            user_ref.update(update_data)
+
+            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id} (isPremium: {is_premium}, price_id: {price_id})")
 
         # Handle subscription.updated
         elif event_type == "subscription.updated":
@@ -890,12 +902,22 @@ async def paddle_webhook(
             status = data.get("status")
             scheduled_change = data.get("scheduled_change")
 
-            print(f"🔄 Updating subscription for user {firebase_uid}: {status}")
+            # Extract price_id from subscription items
+            price_id = None
+            items = data.get("items", [])
+            if items and len(items) > 0:
+                price_id = items[0].get("price", {}).get("id") if isinstance(items[0].get("price"), dict) else items[0].get("price_id")
+
+            print(f"🔄 Updating subscription for user {firebase_uid}: {status} (price_id: {price_id})")
 
             update_data = {
                 "subscription_status": status,
                 "subscription_updated_at": firestore.SERVER_TIMESTAMP,
             }
+
+            # Add price_id if available
+            if price_id:
+                update_data["subscription_price_id"] = price_id
 
             # Set isPremium and premium_status based on subscription status
             if status in ["active", "trialing"]:
@@ -915,7 +937,7 @@ async def paddle_webhook(
             user_ref = db.collection('users').document(firebase_uid)
             user_ref.update(update_data)
 
-            print(f"✅ Updated subscription status for {firebase_uid}: {status} (isPremium: {update_data.get('isPremium', False)})")
+            print(f"✅ Updated subscription status for {firebase_uid}: {status} (isPremium: {update_data.get('isPremium', False)}, price_id: {price_id})")
 
         # Handle subscription.canceled
         elif event_type == "subscription.canceled":
