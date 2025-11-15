@@ -975,6 +975,7 @@ async def paddle_webhook(
             status = data.get("status")
 
             print(f"💳 Transaction completed for user {firebase_uid}: {transaction_id}")
+            print(f"📦 Full transaction data: {json.dumps(data, indent=2, default=str)}")
 
             # Process each item in the transaction
             total_credits_added = 0
@@ -983,20 +984,44 @@ async def paddle_webhook(
                 price = item.get("price", {})
                 product = price.get("product", {})
 
-                # Check if this is a credit package purchase
-                product_custom_data = product.get("custom_data", {})
+                # Helper function to safely convert objects to dicts
+                def safe_dict(obj):
+                    if obj is None:
+                        return {}
+                    if isinstance(obj, dict):
+                        return obj
+                    try:
+                        return vars(obj)
+                    except TypeError:
+                        return getattr(obj, '__dict__', {})
 
-                # Debug: Log what we received
+                # Extract and handle nested custom_data for BOTH product and price
+                # Paddle may nest custom_data under a 'data' key
+                product_custom_data_raw = safe_dict(product.get("custom_data", {}))
+                product_custom_data = product_custom_data_raw.get('data', product_custom_data_raw)
+
+                price_custom_data_raw = safe_dict(price.get("custom_data", {}))
+                price_custom_data = price_custom_data_raw.get('data', price_custom_data_raw)
+
+                # Debug: Log what we received from both sources
                 print(f"   🔍 Product custom_data: {product_custom_data}")
+                print(f"   🔍 Price custom_data: {price_custom_data}")
 
-                # Extract credits amount - try multiple field names for flexibility
+                # Extract credits amount - try BOTH product and price custom_data
+                # Check multiple field names for flexibility
                 credits = 0
-                if isinstance(product_custom_data, dict):
+                if isinstance(product_custom_data, dict) or isinstance(price_custom_data, dict):
                     credits = (
+                        # Try product custom_data first
                         product_custom_data.get("amount") or
                         product_custom_data.get("credit_amount") or
                         product_custom_data.get("credits") or
                         product_custom_data.get("credit_count") or
+                        # Then try price custom_data (CRITICAL FIX - was missing)
+                        price_custom_data.get("amount") or
+                        price_custom_data.get("credit_amount") or
+                        price_custom_data.get("credits") or
+                        price_custom_data.get("credit_count") or
                         0
                     )
 
