@@ -1011,7 +1011,7 @@ async def paddle_webhook(
                 # Check multiple field names for flexibility
                 credits = 0
                 if isinstance(product_custom_data, dict) or isinstance(price_custom_data, dict):
-                    credits = (
+                    credits_raw = (
                         # Try product custom_data first
                         product_custom_data.get("amount") or
                         product_custom_data.get("credit_amount") or
@@ -1025,20 +1025,32 @@ async def paddle_webhook(
                         0
                     )
 
-                if credits and credits > 0:
-                    total_credits_added += int(credits)
+                    # Convert to int immediately with proper error handling
+                    # This handles cases where Paddle returns "40" as string instead of 40
+                    print(f"   🔍 Raw credits value: {credits_raw} (type: {type(credits_raw).__name__})")
+                    try:
+                        credits = int(credits_raw) if credits_raw else 0
+                        print(f"   ✅ Converted to integer: {credits}")
+                    except (ValueError, TypeError) as e:
+                        print(f"   ⚠️ Failed to convert credits value '{credits_raw}': {e}")
+                        credits = 0
+
+                if credits > 0:
+                    total_credits_added += credits
                     print(f"   💰 Found credit package: {credits} credits")
 
             # Add credits to user if any were purchased
             if total_credits_added > 0:
+                print(f"📝 Preparing to add {total_credits_added} credits to user {firebase_uid}")
                 user_ref = db.collection('users').document(firebase_uid)
 
                 # Use Firestore increment to safely add credits
+                print(f"   🔄 Executing Firestore update with Increment({total_credits_added})")
                 user_ref.update({
                     "credits": firestore.Increment(total_credits_added)
                 })
 
-                print(f"✅ Added {total_credits_added} credits to user {firebase_uid}")
+                print(f"✅ Successfully added {total_credits_added} credits to user {firebase_uid}")
 
                 # Log transaction in user's history
                 user_ref.collection('transactions').document(transaction_id).set({
