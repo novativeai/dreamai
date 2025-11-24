@@ -512,6 +512,52 @@ async def create_customer_portal(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
+@app.post("/cancel-subscription")
+async def cancel_subscription(request: Request):
+    """
+    Cancel a user's Paddle subscription.
+    Called when user deletes their account.
+    """
+    body = await request.json()
+    subscription_id = body.get('subscription_id')
+    firebase_uid = body.get('firebase_uid')
+
+    if not subscription_id:
+        raise HTTPException(status_code=400, detail="subscription_id is required")
+
+    print(f"🔄 Canceling subscription {subscription_id} for user {firebase_uid}")
+
+    try:
+        # Cancel the subscription immediately via Paddle API
+        result = paddle.subscriptions.cancel(
+            subscription_id=subscription_id,
+            effective_from="immediately"
+        )
+
+        print(f"✅ Subscription {subscription_id} cancelled successfully")
+
+        # Update Firestore to reflect cancellation (webhook will also do this, but do it now for immediate feedback)
+        if firebase_uid:
+            user_ref = db.collection('users').document(firebase_uid)
+            user_ref.update({
+                "subscription_status": "canceled",
+                "isPremium": False,
+                "premium_status": None,
+                "subscription_canceled_at": firestore.SERVER_TIMESTAMP,
+            })
+
+        return {"success": True, "message": "Subscription cancelled successfully"}
+
+    except ApiError as e:
+        error_msg = getattr(e, 'message', str(e))
+        print(f"❌ Paddle API error cancelling subscription: {error_msg}")
+        # Don't fail account deletion if subscription cancellation fails
+        return {"success": False, "error": error_msg}
+
+    except Exception as e:
+        print(f"❌ Error cancelling subscription: {e}")
+        return {"success": False, "error": str(e)}
+
 @app.get("/products")
 async def get_products():
     """
