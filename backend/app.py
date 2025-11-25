@@ -35,7 +35,7 @@ except Exception as e:
     )
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth as firebase_auth
 # --- END INTEGRATION IMPORTS ---
 
 
@@ -113,6 +113,53 @@ try:
 except (ValueError, TypeError, json.JSONDecodeError) as e:
     raise ValueError(f"Error decoding or parsing Firebase service account from environment variable: {e}")
 # --- END INITIALIZATION ---
+
+
+# =================================================================================
+# === AUTHENTICATION HELPER FUNCTIONS =============================================
+# =================================================================================
+async def verify_firebase_token(authorization: Optional[str] = Header(None)) -> str:
+    """
+    Verify Firebase ID token from Authorization header.
+    Returns the authenticated user's UID.
+    Raises HTTPException 401 if token is invalid or missing.
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header. Please include 'Authorization: Bearer <token>'"
+        )
+
+    # Extract token from "Bearer <token>" format
+    parts = authorization.split(" ")
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header format. Expected 'Bearer <token>'"
+        )
+
+    id_token = parts[1]
+
+    try:
+        # Verify the ID token with Firebase Admin SDK
+        decoded_token = firebase_auth.verify_id_token(id_token)
+        uid = decoded_token.get("uid")
+
+        if not uid:
+            raise HTTPException(status_code=401, detail="Invalid token: missing UID")
+
+        return uid
+
+    except firebase_auth.ExpiredIdTokenError:
+        raise HTTPException(status_code=401, detail="Token has expired. Please sign in again.")
+    except firebase_auth.RevokedIdTokenError:
+        raise HTTPException(status_code=401, detail="Token has been revoked. Please sign in again.")
+    except firebase_auth.InvalidIdTokenError as e:
+        print(f"❌ Invalid ID token: {e}")
+        raise HTTPException(status_code=401, detail="Invalid authentication token.")
+    except Exception as e:
+        print(f"❌ Token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed.")
 
 
 # =================================================================================
@@ -259,54 +306,68 @@ def add_watermark(image_bytes: bytes, is_premium: bool = False, watermark_text: 
 @app.post("/generate/")
 async def generate_image(
     image1: UploadFile = File(...),
-    userId: str = Form(...),  # Required for credit deduction
-    # The payload can still contain these, but we will ignore them
-    image2: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
-    temperature: float = Form(1.0), # temperature is not a direct param for FLUX
-    top_p: float = Form(0.95),       # top_p is not a direct param for FLUX
-    top_k: int = Form(40),         # top_k is not a direct param for FLUX
+    authorization: Optional[str] = Header(None),
+    # Legacy fields kept for backwards compatibility (ignored)
+    userId: Optional[str] = Form(None),  # DEPRECATED: Use Authorization header
+    image2: Optional[UploadFile] = File(None),
+    temperature: float = Form(1.0),
+    top_p: float = Form(0.95),
+    top_k: int = Form(40),
 ):
     """
     Generate an image using Fal AI's FLUX Kontext model based on ONE input image and a prompt.
-    This endpoint maintains the original payload structure for frontend compatibility.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
     Downloads the generated image from fal.ai URL and adds "DreamAI" watermark.
-    Deducts 1 credit from non-premium users.
+    Deducts 1 credit from non-premium users using atomic transaction.
     """
     # Ensure an image was actually sent
     if not image1 or not image1.file:
         raise HTTPException(status_code=400, detail="An image file is required.")
 
-    if not userId:
-        raise HTTPException(status_code=400, detail="userId is required for credit tracking.")
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔐 Authenticated user: {authenticated_user_id}")
 
-    # Check user's premium status and credits
+    # Check user's premium status and deduct credits atomically
+    is_premium = False
     try:
-        user_doc = db.collection('users').document(userId).get()
-        if not user_doc.exists:
-            raise HTTPException(status_code=404, detail="User not found")
+        user_ref = db.collection('users').document(authenticated_user_id)
 
-        user_data = user_doc.to_dict()
-        premium_status = user_data.get('premium_status')
-        is_premium = premium_status == 'active'
-        current_credits = user_data.get('credits', 0)
+        # Use Firestore transaction to atomically check and deduct credits
+        @firestore.transactional
+        def deduct_credit_transaction(transaction, user_ref):
+            user_doc = user_ref.get(transaction=transaction)
 
-        # If not premium, check and deduct credits
-        if not is_premium:
-            if current_credits < 1:
-                raise HTTPException(
-                    status_code=402,  # Payment Required
-                    detail="Insufficient credits. Please purchase more credits or upgrade to premium."
-                )
+            if not user_doc.exists:
+                raise HTTPException(status_code=404, detail="User not found")
 
-            # Deduct 1 credit BEFORE generation
-            user_ref = db.collection('users').document(userId)
-            user_ref.update({
-                "credits": firestore.Increment(-1)
-            })
-            print(f"💳 Deducted 1 credit from user {userId}. Remaining: {current_credits - 1}")
-        else:
-            print(f"👑 Premium user {userId} - no credit deduction")
+            user_data = user_doc.to_dict()
+            premium_status = user_data.get('premium_status')
+            is_premium_user = premium_status == 'active'
+            current_credits = user_data.get('credits', 0)
+
+            # If not premium, check and deduct credits atomically
+            if not is_premium_user:
+                if current_credits < 1:
+                    raise HTTPException(
+                        status_code=402,  # Payment Required
+                        detail="Insufficient credits. Please purchase more credits or upgrade to premium."
+                    )
+
+                # Atomically deduct 1 credit within the transaction
+                transaction.update(user_ref, {
+                    "credits": current_credits - 1
+                })
+                print(f"💳 Deducted 1 credit from user {authenticated_user_id}. Remaining: {current_credits - 1}")
+            else:
+                print(f"👑 Premium user {authenticated_user_id} - no credit deduction")
+
+            return is_premium_user
+
+        # Execute the transaction
+        transaction = db.transaction()
+        is_premium = deduct_credit_transaction(transaction, user_ref)
 
     except HTTPException:
         raise
@@ -403,25 +464,34 @@ async def generate_image(
 
 
 @app.post("/create-checkout")
-async def create_checkout(request: Request):
+async def create_checkout(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
     """
     Create a Paddle checkout session for subscription or credit purchase.
-    Enhanced to handle email parameter and provide better error messages.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
     """
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔐 Authenticated user for checkout: {authenticated_user_id}")
+
     body = await request.json()
     price_id = body.get('priceId')
-    user_id = body.get('userId')
     email = body.get('email')  # Optional: pre-fill customer email
-    
-    if not price_id or not user_id:
+
+    # userId from body is now ignored - we use the authenticated user ID
+    # This prevents users from creating checkouts for other users
+
+    if not price_id:
         raise HTTPException(
-            status_code=400, 
-            detail="priceId and userId are required"
+            status_code=400,
+            detail="priceId is required"
         )
-    
+
     try:
-        # Get user document from Firebase
-        user_doc = db.collection('users').document(user_id).get()
+        # Get user document from Firebase using authenticated user ID
+        user_doc = db.collection('users').document(authenticated_user_id).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}
         paddle_customer_id = user_data.get('paddle_customer_id')
         
@@ -434,19 +504,19 @@ async def create_checkout(request: Request):
             "items": [
                 {"price_id": price_id, "quantity": 1}
             ],
-            "custom_data": {"firebase_uid": user_id},
+            "custom_data": {"firebase_uid": authenticated_user_id},
             "success_url": "https://dreamai-checkpoint.netlify.app/payment-success",
         }
-        
+
         # Add customer_id if exists (for returning customers)
         if paddle_customer_id:
             txn_payload["customer_id"] = paddle_customer_id
-        
+
         # Add email if available (for new customers)
         if email and not paddle_customer_id:
             txn_payload["customer_email"] = email
 
-        print(f"Creating checkout for user {user_id} with price {price_id}")
+        print(f"Creating checkout for user {authenticated_user_id} with price {price_id}")
         transaction = paddle.transactions.create(txn_payload)
 
         # Extract checkout URL intelligently
@@ -492,12 +562,20 @@ async def create_checkout(request: Request):
 
 
 @app.post("/create-customer-portal")
-async def create_customer_portal(request: Request):
-    body = await request.json()
-    user_id = body.get('userId')
-    if not user_id:
-        raise HTTPException(status_code=400, detail="userId is required")
-    user_doc = db.collection('users').document(user_id).get()
+async def create_customer_portal(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Create a Paddle customer portal link for subscription management.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+    """
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔐 Authenticated user for customer portal: {authenticated_user_id}")
+
+    # userId from body is now ignored - we use the authenticated user ID
+    user_doc = db.collection('users').document(authenticated_user_id).get()
     if not user_doc.exists or not user_doc.to_dict().get('paddle_customer_id'):
         raise HTTPException(status_code=404, detail="User has no subscription to manage.")
     paddle_customer_id = user_doc.to_dict().get('paddle_customer_id')
@@ -513,19 +591,32 @@ async def create_customer_portal(request: Request):
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 @app.post("/cancel-subscription")
-async def cancel_subscription(request: Request):
+async def cancel_subscription(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
     """
     Cancel a user's Paddle subscription.
     Called when user deletes their account.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
     """
-    body = await request.json()
-    subscription_id = body.get('subscription_id')
-    firebase_uid = body.get('firebase_uid')
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔐 Authenticated user for subscription cancellation: {authenticated_user_id}")
+
+    # Get user's subscription from Firestore (don't trust client-provided subscription_id)
+    user_doc = db.collection('users').document(authenticated_user_id).get()
+    if not user_doc.exists:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_data = user_doc.to_dict()
+    subscription_id = user_data.get('subscription_id')
 
     if not subscription_id:
-        raise HTTPException(status_code=400, detail="subscription_id is required")
+        # No subscription to cancel - this is fine
+        return {"success": True, "message": "No subscription to cancel"}
 
-    print(f"🔄 Canceling subscription {subscription_id} for user {firebase_uid}")
+    print(f"🔄 Canceling subscription {subscription_id} for user {authenticated_user_id}")
 
     try:
         # Cancel the subscription immediately via Paddle API
@@ -537,21 +628,19 @@ async def cancel_subscription(request: Request):
         print(f"✅ Subscription {subscription_id} cancelled successfully")
 
         # Update Firestore to reflect cancellation (webhook will also do this, but do it now for immediate feedback)
-        if firebase_uid:
-            user_ref = db.collection('users').document(firebase_uid)
-            user_ref.update({
-                "subscription_status": "canceled",
-                "isPremium": False,
-                "premium_status": None,
-                "subscription_canceled_at": firestore.SERVER_TIMESTAMP,
-            })
+        user_ref = db.collection('users').document(authenticated_user_id)
+        user_ref.update({
+            "subscription_status": "canceled",
+            "isPremium": False,
+            "premium_status": None,
+            "subscription_canceled_at": firestore.SERVER_TIMESTAMP,
+        })
 
         return {"success": True, "message": "Subscription cancelled successfully"}
 
     except ApiError as e:
         error_msg = getattr(e, 'message', str(e))
         print(f"❌ Paddle API error cancelling subscription: {error_msg}")
-        # Don't fail account deletion if subscription cancellation fails
         return {"success": False, "error": error_msg}
 
     except Exception as e:
