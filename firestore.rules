@@ -3,17 +3,36 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Users collection - users can read and write their own data
+    // Users collection - users can read their own data, but only update non-sensitive fields
+    // Sensitive fields (credits, isPremium, premium_status, subscription_*) are only modified by backend Admin SDK
     match /users/{userId} {
       allow read: if request.auth != null && request.auth.uid == userId;
-      allow write: if request.auth != null && request.auth.uid == userId;
-      allow create: if request.auth != null && request.auth.uid == userId;
-      allow update: if request.auth != null && request.auth.uid == userId;
 
-      // Subcollection: transactions
+      // Allow initial profile creation with safe defaults only
+      allow create: if request.auth != null &&
+                       request.auth.uid == userId &&
+                       request.resource.data.credits == 5 &&
+                       request.resource.data.isPremium == false &&
+                       request.resource.data.premium_status == null;
+
+      // Allow update only for non-sensitive fields (block financial/subscription fields)
+      allow update: if request.auth != null &&
+                       request.auth.uid == userId &&
+                       // Prevent modification of sensitive fields
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                         'credits',
+                         'isPremium',
+                         'premium_status',
+                         'subscription_id',
+                         'subscription_status',
+                         'subscription_price_id',
+                         'paddle_customer_id'
+                       ]);
+
+      // Subcollection: transactions - read only (backend creates via Admin SDK)
       match /transactions/{transactionId} {
         allow read: if request.auth != null && request.auth.uid == userId;
-        allow create: if request.auth != null && request.auth.uid == userId;
+        // Create/write only allowed via Admin SDK (backend)
       }
     }
 
