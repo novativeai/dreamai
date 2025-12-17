@@ -48,6 +48,7 @@ app.add_middleware(
     allow_origins=[
         "https://dreamai-web.vercel.app",  # Next.js 16 production deployment
         "https://dreamai-web-sooty.vercel.app",  # Next.js 16 alternate deployment
+        "https://akmldsfmasdfmma.space",  # Custom domain deployment
         "https://dreamai-generator.vercel.app",  # Next.js production deployment
         "https://dreamai-checkpoint.netlify.app",
         "http://localhost:8081",
