@@ -627,8 +627,9 @@ async def cancel_subscription(
         # First, fetch the subscription from Paddle to check its current status
         subscription = paddle.subscriptions.get(subscription_id=subscription_id)
         current_status = subscription.status if subscription else None
+        scheduled_change = getattr(subscription, 'scheduled_change', None)
 
-        print(f"📋 Current subscription status: {current_status}")
+        print(f"📋 Current subscription status: {current_status}, scheduled_change: {scheduled_change}")
 
         # Check if already cancelled - these states don't need/allow cancellation
         # Note: past_due and paused CAN be cancelled, so we don't include them here
@@ -645,6 +646,13 @@ async def cancel_subscription(
             })
 
             return {"success": True, "message": f"Subscription already {current_status}"}
+
+        # Check if subscription is already scheduled to cancel
+        # In this case, we want to cancel immediately instead of waiting
+        if scheduled_change:
+            scheduled_action = getattr(scheduled_change, 'action', None)
+            if scheduled_action and str(scheduled_action).lower() == "cancel":
+                print(f"ℹ️ Subscription {subscription_id} is scheduled to cancel, proceeding with immediate cancellation")
 
         # Cancel the subscription immediately via Paddle API
         result = paddle.subscriptions.cancel(
