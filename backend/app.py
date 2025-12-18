@@ -630,9 +630,10 @@ async def cancel_subscription(
 
         print(f"📋 Current subscription status: {current_status}")
 
-        # Check if already cancelled or in a non-cancellable state
-        non_cancellable_states = ["canceled", "cancelled", "past_due", "deleted"]
-        if current_status and str(current_status).lower() in non_cancellable_states:
+        # Check if already cancelled - these states don't need/allow cancellation
+        # Note: past_due and paused CAN be cancelled, so we don't include them here
+        already_cancelled_states = ["canceled", "cancelled"]
+        if current_status and str(current_status).lower() in already_cancelled_states:
             print(f"ℹ️ Subscription {subscription_id} is already {current_status}, treating as success")
 
             # Update Firestore to ensure it reflects the cancelled state
