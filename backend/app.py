@@ -621,7 +621,30 @@ async def cancel_subscription(
 
     print(f"🔄 Canceling subscription {subscription_id} for user {authenticated_user_id}")
 
+    user_ref = db.collection('users').document(authenticated_user_id)
+
     try:
+        # First, fetch the subscription from Paddle to check its current status
+        subscription = paddle.subscriptions.get(subscription_id=subscription_id)
+        current_status = subscription.status if subscription else None
+
+        print(f"📋 Current subscription status: {current_status}")
+
+        # Check if already cancelled or in a non-cancellable state
+        non_cancellable_states = ["canceled", "cancelled", "past_due", "deleted"]
+        if current_status and str(current_status).lower() in non_cancellable_states:
+            print(f"ℹ️ Subscription {subscription_id} is already {current_status}, treating as success")
+
+            # Update Firestore to ensure it reflects the cancelled state
+            user_ref.update({
+                "subscription_status": "canceled",
+                "isPremium": False,
+                "premium_status": None,
+                "subscription_canceled_at": firestore.SERVER_TIMESTAMP,
+            })
+
+            return {"success": True, "message": f"Subscription already {current_status}"}
+
         # Cancel the subscription immediately via Paddle API
         result = paddle.subscriptions.cancel(
             subscription_id=subscription_id,
@@ -631,7 +654,6 @@ async def cancel_subscription(
         print(f"✅ Subscription {subscription_id} cancelled successfully")
 
         # Update Firestore to reflect cancellation (webhook will also do this, but do it now for immediate feedback)
-        user_ref = db.collection('users').document(authenticated_user_id)
         user_ref.update({
             "subscription_status": "canceled",
             "isPremium": False,
@@ -643,12 +665,39 @@ async def cancel_subscription(
 
     except ApiError as e:
         error_msg = getattr(e, 'message', str(e))
-        print(f"❌ Paddle API error cancelling subscription: {error_msg}")
-        return {"success": False, "error": error_msg}
+        error_code = getattr(e, 'code', None)
+        print(f"❌ Paddle API error cancelling subscription: {error_msg} (code: {error_code})")
+
+        # Handle specific error cases
+        # If subscription not found or already cancelled, treat as success for account deletion flow
+        error_lower = str(error_msg).lower()
+        if "not found" in error_lower or "canceled" in error_lower or "cancelled" in error_lower:
+            print(f"ℹ️ Treating error as success for account deletion: {error_msg}")
+            user_ref.update({
+                "subscription_status": "canceled",
+                "isPremium": False,
+                "premium_status": None,
+                "subscription_id": None,
+            })
+            return {"success": True, "message": "Subscription cleared"}
+
+        return {"success": False, "error": f"Failed to cancel subscription: {error_msg}"}
 
     except Exception as e:
         print(f"❌ Error cancelling subscription: {e}")
-        return {"success": False, "error": str(e)}
+        error_str = str(e).lower()
+
+        # Handle edge cases where subscription might already be gone
+        if "not found" in error_str:
+            user_ref.update({
+                "subscription_status": "canceled",
+                "isPremium": False,
+                "premium_status": None,
+                "subscription_id": None,
+            })
+            return {"success": True, "message": "Subscription cleared"}
+
+        return {"success": False, "error": f"An error occurred: {str(e)}"}
 
 @app.get("/products")
 async def get_products():
