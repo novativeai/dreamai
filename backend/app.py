@@ -499,10 +499,45 @@ async def create_checkout(
         user_doc = db.collection('users').document(authenticated_user_id).get()
         user_data = user_doc.to_dict() if user_doc.exists else {}
         paddle_customer_id = user_data.get('paddle_customer_id')
-        
+        has_used_trial = user_data.get('hasUsedTrial', False)
+
         # If no email provided, try to get from Firebase
         if not email and user_data:
             email = user_data.get('email')
+
+        # Check if price has a trial period and if user is eligible
+        try:
+            price = paddle.prices.get(price_id)
+            trial_period = getattr(price, 'trial_period', None)
+
+            if trial_period and has_used_trial:
+                print(f"❌ User {authenticated_user_id} already used free trial, blocking trial subscription")
+                raise HTTPException(
+                    status_code=403,
+                    detail="You have already used your free trial. Please select a different plan."
+                )
+
+            # Also check deleted_accounts if user hasn't been flagged yet
+            if trial_period and email and not has_used_trial:
+                email_normalized = email.lower().strip()
+                archive_doc = db.collection('deleted_accounts').document(email_normalized).get()
+                if archive_doc.exists:
+                    archive_data = archive_doc.to_dict()
+                    if archive_data.get('hasUsedTrial', False):
+                        print(f"❌ User {email_normalized} found in deleted_accounts with trial history, blocking")
+                        # Update current user's hasUsedTrial flag
+                        db.collection('users').document(authenticated_user_id).update({
+                            "hasUsedTrial": True
+                        })
+                        raise HTTPException(
+                            status_code=403,
+                            detail="You have already used your free trial. Please select a different plan."
+                        )
+        except HTTPException:
+            raise
+        except Exception as price_check_error:
+            # Don't block checkout if price check fails - just log it
+            print(f"⚠️ Could not check price trial period: {price_check_error}")
 
         # Build transaction payload
         txn_payload = {
@@ -709,6 +744,185 @@ async def cancel_subscription(
             return {"success": True, "message": "Subscription cleared"}
 
         return {"success": False, "error": f"An error occurred: {str(e)}"}
+
+
+@app.post("/archive-deleted-user")
+async def archive_deleted_user(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Archive user data before account deletion.
+    Saves credits and trial usage to deleted_accounts collection for future restoration.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+    """
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔐 Archiving data for user: {authenticated_user_id}")
+
+    try:
+        # Get user data from Firestore
+        user_ref = db.collection('users').document(authenticated_user_id)
+        user_doc = user_ref.get()
+
+        if not user_doc.exists:
+            return {"success": True, "message": "No user data to archive"}
+
+        user_data = user_doc.to_dict()
+        email = user_data.get('email')
+
+        if not email:
+            print(f"⚠️ User {authenticated_user_id} has no email, skipping archive")
+            return {"success": True, "message": "No email to archive"}
+
+        # Normalize email for consistent lookups
+        email_normalized = email.lower().strip()
+
+        # Check if user ever had a trial (subscription status was 'trialing' or has trial history)
+        subscription_status = user_data.get('subscription_status', '')
+        has_used_trial = (
+            subscription_status == 'trialing' or
+            user_data.get('hasUsedTrial', False) or
+            user_data.get('subscription_id') is not None  # Any subscription means they've engaged with premium
+        )
+
+        # Get current credits
+        credits = user_data.get('credits', 0)
+
+        # Archive data to deleted_accounts collection (keyed by normalized email)
+        archive_ref = db.collection('deleted_accounts').document(email_normalized)
+        existing_archive = archive_ref.get()
+
+        if existing_archive.exists:
+            # User has deleted account before - update with new data
+            existing_data = existing_archive.to_dict()
+            # Keep the highest credit count (in case they had more before)
+            existing_credits = existing_data.get('credits', 0)
+            # Always mark as hasUsedTrial if they ever had one
+            existing_trial = existing_data.get('hasUsedTrial', False)
+
+            archive_ref.update({
+                "credits": max(credits, existing_credits),
+                "hasUsedTrial": has_used_trial or existing_trial,
+                "lastDeletedAt": firestore.SERVER_TIMESTAMP,
+                "lastDeletedUid": authenticated_user_id,
+                "paddle_customer_id": user_data.get('paddle_customer_id') or existing_data.get('paddle_customer_id'),
+                "deletionCount": firestore.Increment(1),
+            })
+            print(f"📦 Updated archive for {email_normalized}: credits={max(credits, existing_credits)}, hasUsedTrial={has_used_trial or existing_trial}")
+        else:
+            # First time deletion - create archive
+            archive_ref.set({
+                "email": email_normalized,
+                "credits": credits,
+                "hasUsedTrial": has_used_trial,
+                "firstDeletedAt": firestore.SERVER_TIMESTAMP,
+                "lastDeletedAt": firestore.SERVER_TIMESTAMP,
+                "lastDeletedUid": authenticated_user_id,
+                "paddle_customer_id": user_data.get('paddle_customer_id'),
+                "deletionCount": 1,
+            })
+            print(f"📦 Created archive for {email_normalized}: credits={credits}, hasUsedTrial={has_used_trial}")
+
+        return {
+            "success": True,
+            "message": "User data archived successfully",
+            "archived": {
+                "credits": credits,
+                "hasUsedTrial": has_used_trial
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error archiving user data: {e}")
+        import traceback
+        traceback.print_exc()
+        # Don't block deletion if archive fails - just log it
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/check-deleted-account")
+async def check_deleted_account(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Check if user's email has a deleted account with credits/trial history.
+    Called after account creation to restore credits.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+    """
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+    print(f"🔍 Checking deleted account for user: {authenticated_user_id}")
+
+    try:
+        # Get current user's email from Firestore
+        user_ref = db.collection('users').document(authenticated_user_id)
+        user_doc = user_ref.get()
+
+        if not user_doc.exists:
+            return {"success": False, "error": "User not found"}
+
+        user_data = user_doc.to_dict()
+        email = user_data.get('email')
+
+        if not email:
+            return {"success": True, "found": False, "message": "No email on account"}
+
+        # Normalize email for lookup
+        email_normalized = email.lower().strip()
+
+        # Check deleted_accounts collection
+        archive_ref = db.collection('deleted_accounts').document(email_normalized)
+        archive_doc = archive_ref.get()
+
+        if not archive_doc.exists:
+            return {"success": True, "found": False, "message": "No previous account found"}
+
+        archive_data = archive_doc.to_dict()
+        archived_credits = archive_data.get('credits', 0)
+        has_used_trial = archive_data.get('hasUsedTrial', False)
+
+        print(f"📦 Found archived account for {email_normalized}: credits={archived_credits}, hasUsedTrial={has_used_trial}")
+
+        # Restore credits and set trial flag on current user
+        update_data = {
+            "hasUsedTrial": has_used_trial,
+            "restoredFromDeletedAccount": True,
+            "restoredAt": firestore.SERVER_TIMESTAMP,
+        }
+
+        # Add credits if they had any
+        if archived_credits > 0:
+            # Use increment to add to any existing credits
+            update_data["credits"] = firestore.Increment(archived_credits)
+
+        user_ref.update(update_data)
+
+        # Mark archive as restored (but keep the data for future reference)
+        archive_ref.update({
+            "restoredToUid": authenticated_user_id,
+            "restoredAt": firestore.SERVER_TIMESTAMP,
+            "credits": 0,  # Zero out credits after restoration
+        })
+
+        print(f"✅ Restored {archived_credits} credits and trial flag for {email_normalized}")
+
+        return {
+            "success": True,
+            "found": True,
+            "restored": {
+                "credits": archived_credits,
+                "hasUsedTrial": has_used_trial
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Error checking deleted account: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
 
 @app.get("/products")
 async def get_products():
@@ -1076,6 +1290,9 @@ async def paddle_webhook(
             is_premium = status in ["active", "trialing"]
             premium_status = "active" if is_premium else None
 
+            # Mark hasUsedTrial if they started a trial (prevents future trial abuse)
+            is_trialing = status == "trialing"
+
             user_ref = db.collection('users').document(firebase_uid)
             update_data = {
                 "subscription_id": subscription_id,
@@ -1086,13 +1303,18 @@ async def paddle_webhook(
                 "subscription_created_at": firestore.SERVER_TIMESTAMP,
             }
 
+            # Mark trial usage to prevent future trial abuse
+            if is_trialing:
+                update_data["hasUsedTrial"] = True
+                print(f"🏷️ Marking user {firebase_uid} as hasUsedTrial=True")
+
             # Add price_id if available
             if price_id:
                 update_data["subscription_price_id"] = price_id
 
             user_ref.update(update_data)
 
-            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id} (isPremium: {is_premium}, price_id: {price_id})")
+            print(f"✅ Updated user {firebase_uid} with subscription {subscription_id} (isPremium: {is_premium}, price_id: {price_id}, trialing: {is_trialing})")
 
         # Handle subscription.updated
         elif event_type == "subscription.updated":
