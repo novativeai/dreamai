@@ -27,6 +27,8 @@ try:
     from paddle_billing import Client, Environment, Options
     from paddle_billing.Exceptions.ApiError import ApiError
     from paddle_billing.Notifications import Verifier, Secret
+    from paddle_billing.Resources.Subscriptions.Operations import CancelSubscription
+    from paddle_billing.Entities.Subscriptions import SubscriptionEffectiveFrom
 except Exception as e:
     # Provide a clearer runtime error if paddle_billing is missing
     raise ImportError(
@@ -656,8 +658,8 @@ async def cancel_subscription(
 
         # Cancel the subscription immediately via Paddle API
         result = paddle.subscriptions.cancel(
-            subscription_id=subscription_id,
-            effective_from="immediately"
+            subscription_id,
+            CancelSubscription(effective_from=SubscriptionEffectiveFrom.Immediately)
         )
 
         print(f"✅ Subscription {subscription_id} cancelled successfully")
