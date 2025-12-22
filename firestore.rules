@@ -30,6 +30,9 @@ service cloud.firestore {
                          'paddle_customer_id'
                        ]);
 
+      // Allow users to delete their own account
+      allow delete: if request.auth != null && request.auth.uid == userId;
+
       // Subcollection: transactions - read only (backend creates via Admin SDK)
       match /transactions/{transactionId} {
         allow read: if request.auth != null && request.auth.uid == userId;
