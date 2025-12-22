@@ -820,12 +820,13 @@ async def archive_deleted_user(
         # Normalize email for consistent lookups
         email_normalized = email.lower().strip()
 
-        # Check if user ever had a trial (subscription status was 'trialing' or has trial history)
+        # Check if user ever had a trial - be precise to avoid blocking credit-only purchasers
         subscription_status = user_data.get('subscription_status', '')
         has_used_trial = (
-            subscription_status == 'trialing' or
-            user_data.get('hasUsedTrial', False) or
-            user_data.get('subscription_id') is not None  # Any subscription means they've engaged with premium
+            user_data.get('hasUsedTrial', False) or  # Explicit flag from webhook
+            user_data.get('trialStartedAt') is not None or  # Explicit trial marker
+            subscription_status == 'trialing' or  # Currently in trial
+            subscription_status in ['active', 'canceled', 'paused']  # Had an active subscription (not just credits)
         )
 
         # Get current credits and device ID
@@ -976,18 +977,24 @@ async def check_deleted_account(
         print(f"📦 Found archived account for {email_normalized}: credits={archived_credits}, hasUsedTrial={has_used_trial}")
 
         # CRITICAL FIX: Calculate the correct credit amount
-        # If user is a fresh account (has exactly 5 credits = default), replace with archived credits
-        # If user already has different credits, take the maximum (but don't stack)
-        # This prevents the +5 duplication exploit
+        # Frontend now creates users with 0 credits initially
+        # If fresh account (0 credits), give archived credits (minimum 5 if not trial-blocked)
+        # If already has credits, take the higher value (but don't stack)
 
-        if current_credits == 5:
-            # Fresh account - REPLACE the 5 default credits with archived credits
-            # User gets MAX(archived_credits, 5), not archived_credits + 5
+        if current_credits == 0:
+            # Fresh account - set to archived credits (at least 5 if no trial block)
+            # If trial blocked, only give archived credits (no bonus)
+            if has_used_trial:
+                final_credits = archived_credits  # No default bonus for trial-blocked users
+            else:
+                final_credits = max(archived_credits, 5)  # At least 5 for new users
+            print(f"   Fresh account detected (0 credits). Setting to {final_credits} credits (trial_blocked: {has_used_trial})")
+        elif current_credits == 5:
+            # Legacy: account created with old code (5 default credits)
             final_credits = max(archived_credits, 5)
-            print(f"   Fresh account detected (5 credits). Setting to {final_credits} credits")
+            print(f"   Legacy account detected (5 credits). Setting to {final_credits} credits")
         else:
-            # Not a fresh account (shouldn't happen normally, but handle gracefully)
-            # Take the higher of current or archived, don't add
+            # Existing account with different credits - take the higher value
             final_credits = max(current_credits, archived_credits)
             print(f"   Existing credits ({current_credits}). Setting to {final_credits} credits")
 
