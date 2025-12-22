@@ -1388,6 +1388,27 @@ async def paddle_webhook(
             # Mark hasUsedTrial if they started a trial (prevents future trial abuse)
             is_trialing = status == "trialing"
 
+            # Determine subscription tier and credits from product name
+            # Premium: 80 credits/month, Premium+: 120 credits/month
+            subscription_credits = 80  # Default to Premium
+            subscription_tier = "premium"
+
+            if price_id:
+                try:
+                    price = paddle.prices.get(price_id)
+                    product = paddle.products.get(price.product_id)
+                    product_name = product.name if product else ""
+                    print(f"📦 Product name: {product_name}")
+
+                    if "Premium +" in product_name or "Premium+" in product_name:
+                        subscription_credits = 120
+                        subscription_tier = "premium_plus"
+                        print(f"🌟 Premium+ subscription - setting {subscription_credits} credits")
+                    else:
+                        print(f"⭐ Premium subscription - setting {subscription_credits} credits")
+                except Exception as e:
+                    print(f"⚠️ Could not determine subscription tier from price: {e}")
+
             user_ref = db.collection('users').document(firebase_uid)
             update_data = {
                 "subscription_id": subscription_id,
@@ -1395,6 +1416,8 @@ async def paddle_webhook(
                 "subscription_status": status,
                 "isPremium": is_premium,
                 "premium_status": premium_status,
+                "subscription_tier": subscription_tier,
+                "credits": subscription_credits,  # Set monthly credits based on tier
                 "subscription_created_at": firestore.SERVER_TIMESTAMP,
             }
 
