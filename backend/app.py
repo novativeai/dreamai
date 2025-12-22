@@ -976,27 +976,10 @@ async def check_deleted_account(
 
         print(f"📦 Found archived account for {email_normalized}: credits={archived_credits}, hasUsedTrial={has_used_trial}")
 
-        # CRITICAL FIX: Calculate the correct credit amount
-        # Frontend now creates users with 0 credits initially
-        # If fresh account (0 credits), give archived credits (minimum 5 if not trial-blocked)
-        # If already has credits, take the higher value (but don't stack)
-
-        if current_credits == 0:
-            # Fresh account - set to archived credits (at least 5 if no trial block)
-            # If trial blocked, only give archived credits (no bonus)
-            if has_used_trial:
-                final_credits = archived_credits  # No default bonus for trial-blocked users
-            else:
-                final_credits = max(archived_credits, 5)  # At least 5 for new users
-            print(f"   Fresh account detected (0 credits). Setting to {final_credits} credits (trial_blocked: {has_used_trial})")
-        elif current_credits == 5:
-            # Legacy: account created with old code (5 default credits)
-            final_credits = max(archived_credits, 5)
-            print(f"   Legacy account detected (5 credits). Setting to {final_credits} credits")
-        else:
-            # Existing account with different credits - take the higher value
-            final_credits = max(current_credits, archived_credits)
-            print(f"   Existing credits ({current_credits}). Setting to {final_credits} credits")
+        # Returning user: SET to exactly their archived credits (no bonus)
+        # This prevents credit exploitation from delete/recreate cycles
+        final_credits = archived_credits
+        print(f"   Returning user. Setting to {final_credits} archived credits")
 
         # Restore credits (SET, not INCREMENT) and set trial flag on current user
         update_data = {
