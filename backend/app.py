@@ -60,7 +60,6 @@ app.add_middleware(
         # Expo web default
         "https://vision-ai-tester.netlify.app",
         "exp://localhost:8081",   # Expo native
-        "*"  # Allow all origins for development - restrict in production
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -340,6 +339,7 @@ async def generate_image(
         user_ref = db.collection('users').document(authenticated_user_id)
 
         # Use Firestore transaction to atomically check and deduct credits
+        # ALL users (including premium) now use credits
         @firestore.transactional
         def deduct_credit_transaction(transaction, user_ref):
             user_doc = user_ref.get(transaction=transaction)
@@ -352,21 +352,28 @@ async def generate_image(
             is_premium_user = premium_status == 'active'
             current_credits = user_data.get('credits', 0)
 
-            # If not premium, check and deduct credits atomically
-            if not is_premium_user:
-                if current_credits < 1:
+            # ALL users must have credits (premium users get 80/120 monthly credits)
+            if current_credits < 1:
+                if is_premium_user:
+                    raise HTTPException(
+                        status_code=402,  # Payment Required
+                        detail="No credits remaining this month. Your credits reset with your billing cycle."
+                    )
+                else:
                     raise HTTPException(
                         status_code=402,  # Payment Required
                         detail="Insufficient credits. Please purchase more credits or upgrade to premium."
                     )
 
-                # Atomically deduct 1 credit within the transaction
-                transaction.update(user_ref, {
-                    "credits": current_credits - 1
-                })
-                print(f"💳 Deducted 1 credit from user {authenticated_user_id}. Remaining: {current_credits - 1}")
+            # Atomically deduct 1 credit within the transaction (for ALL users)
+            transaction.update(user_ref, {
+                "credits": current_credits - 1
+            })
+
+            if is_premium_user:
+                print(f"👑 Premium user {authenticated_user_id} - deducted 1 credit. Remaining: {current_credits - 1}")
             else:
-                print(f"👑 Premium user {authenticated_user_id} - no credit deduction")
+                print(f"💳 Deducted 1 credit from user {authenticated_user_id}. Remaining: {current_credits - 1}")
 
             return is_premium_user
 
@@ -1193,30 +1200,36 @@ async def get_products():
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
-@app.get("/subscription-status/{user_id}")
-async def get_subscription_status(user_id: str):
+@app.get("/subscription-status")
+async def get_subscription_status(
+    authorization: Optional[str] = Header(None)
+):
     """
-    Get current subscription status for a user.
-    Useful for frontend to check subscription state.
+    Get current subscription status for authenticated user.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
     """
+    # SECURITY: Verify Firebase ID token and get authenticated user ID
+    authenticated_user_id = await verify_firebase_token(authorization)
+
     try:
-        user_doc = db.collection('users').document(user_id).get()
-        
+        user_doc = db.collection('users').document(authenticated_user_id).get()
+
         if not user_doc.exists:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         user_data = user_doc.to_dict()
-        
+
+        # Only return non-sensitive subscription info
         return {
             "success": True,
-            "user_id": user_id,
+            "user_id": authenticated_user_id,
             "premium_status": user_data.get("premium_status"),
             "subscription_status": user_data.get("subscription_status"),
-            "subscription_id": user_data.get("subscription_id"),
-            "paddle_customer_id": user_data.get("paddle_customer_id"),
+            "subscription_tier": user_data.get("subscription_tier"),
             "credits": user_data.get("credits", 0),
+            "isPremium": user_data.get("isPremium", False),
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
