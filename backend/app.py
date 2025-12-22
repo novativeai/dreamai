@@ -476,6 +476,11 @@ async def create_checkout(
     """
     Create a Paddle checkout session for subscription or credit purchase.
     AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+
+    Trial Prevention:
+    - Checks user's hasUsedTrial flag
+    - Checks deleted_accounts collection by email
+    - Checks trial_blocked_devices collection by device_id
     """
     # SECURITY: Verify Firebase ID token and get authenticated user ID
     authenticated_user_id = await verify_firebase_token(authorization)
@@ -484,6 +489,7 @@ async def create_checkout(
     body = await request.json()
     price_id = body.get('priceId')
     email = body.get('email')  # Optional: pre-fill customer email
+    device_id = body.get('deviceId')  # Device fingerprint for trial abuse prevention
 
     # userId from body is now ignored - we use the authenticated user ID
     # This prevents users from creating checkouts for other users
@@ -510,29 +516,65 @@ async def create_checkout(
             price = paddle.prices.get(price_id)
             trial_period = getattr(price, 'trial_period', None)
 
-            if trial_period and has_used_trial:
-                print(f"❌ User {authenticated_user_id} already used free trial, blocking trial subscription")
-                raise HTTPException(
-                    status_code=403,
-                    detail="You have already used your free trial. Please select a different plan."
-                )
+            if trial_period:
+                # Build detailed block reason for better error messages
+                block_reason = None
 
-            # Also check deleted_accounts if user hasn't been flagged yet
-            if trial_period and email and not has_used_trial:
-                email_normalized = email.lower().strip()
-                archive_doc = db.collection('deleted_accounts').document(email_normalized).get()
-                if archive_doc.exists:
-                    archive_data = archive_doc.to_dict()
-                    if archive_data.get('hasUsedTrial', False):
-                        print(f"❌ User {email_normalized} found in deleted_accounts with trial history, blocking")
-                        # Update current user's hasUsedTrial flag
-                        db.collection('users').document(authenticated_user_id).update({
-                            "hasUsedTrial": True
-                        })
-                        raise HTTPException(
-                            status_code=403,
-                            detail="You have already used your free trial. Please select a different plan."
+                # Check 1: User's hasUsedTrial flag
+                if has_used_trial:
+                    block_reason = "email"
+                    print(f"❌ User {authenticated_user_id} already used free trial (hasUsedTrial flag)")
+
+                # Check 2: Deleted accounts by email
+                if not block_reason and email:
+                    email_normalized = email.lower().strip()
+                    archive_doc = db.collection('deleted_accounts').document(email_normalized).get()
+                    if archive_doc.exists:
+                        archive_data = archive_doc.to_dict()
+                        if archive_data.get('hasUsedTrial', False):
+                            block_reason = "email"
+                            print(f"❌ Email {email_normalized} found in deleted_accounts with trial history")
+                            # Update current user's hasUsedTrial flag
+                            db.collection('users').document(authenticated_user_id).update({
+                                "hasUsedTrial": True
+                            })
+
+                # Check 3: Device ID (if provided)
+                if not block_reason and device_id:
+                    device_doc = db.collection('trial_blocked_devices').document(device_id).get()
+                    if device_doc.exists:
+                        device_data = device_doc.to_dict()
+                        if device_data.get('blocked', False):
+                            block_reason = "device"
+                            print(f"❌ Device {device_id} found in blocked devices")
+                            # Also mark user as having used trial
+                            db.collection('users').document(authenticated_user_id).update({
+                                "hasUsedTrial": True,
+                                "trialBlockedByDevice": device_id,
+                            })
+
+                # If blocked, return appropriate error
+                if block_reason:
+                    if block_reason == "device":
+                        error_message = (
+                            "Free trial not available. This device has already been used for a free trial. "
+                            "Please select a paid plan to continue."
                         )
+                    else:  # email
+                        error_message = (
+                            "Free trial not available. This email address has already been used for a free trial. "
+                            "Please select a paid plan or use a different account."
+                        )
+
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "message": error_message,
+                            "code": "TRIAL_NOT_AVAILABLE",
+                            "reason": block_reason,
+                        }
+                    )
+
         except HTTPException:
             raise
         except Exception as price_check_error:
@@ -786,8 +828,9 @@ async def archive_deleted_user(
             user_data.get('subscription_id') is not None  # Any subscription means they've engaged with premium
         )
 
-        # Get current credits
+        # Get current credits and device ID
         credits = user_data.get('credits', 0)
+        device_id = user_data.get('deviceId')
 
         # Archive data to deleted_accounts collection (keyed by normalized email)
         archive_ref = db.collection('deleted_accounts').document(email_normalized)
@@ -801,18 +844,24 @@ async def archive_deleted_user(
             # Always mark as hasUsedTrial if they ever had one
             existing_trial = existing_data.get('hasUsedTrial', False)
 
-            archive_ref.update({
+            update_data = {
                 "credits": max(credits, existing_credits),
                 "hasUsedTrial": has_used_trial or existing_trial,
                 "lastDeletedAt": firestore.SERVER_TIMESTAMP,
                 "lastDeletedUid": authenticated_user_id,
                 "paddle_customer_id": user_data.get('paddle_customer_id') or existing_data.get('paddle_customer_id'),
                 "deletionCount": firestore.Increment(1),
-            })
+            }
+
+            # Add device ID to the list of associated devices
+            if device_id:
+                update_data["deviceIds"] = firestore.ArrayUnion([device_id])
+
+            archive_ref.update(update_data)
             print(f"📦 Updated archive for {email_normalized}: credits={max(credits, existing_credits)}, hasUsedTrial={has_used_trial or existing_trial}")
         else:
             # First time deletion - create archive
-            archive_ref.set({
+            archive_data = {
                 "email": email_normalized,
                 "credits": credits,
                 "hasUsedTrial": has_used_trial,
@@ -821,8 +870,24 @@ async def archive_deleted_user(
                 "lastDeletedUid": authenticated_user_id,
                 "paddle_customer_id": user_data.get('paddle_customer_id'),
                 "deletionCount": 1,
-            })
+            }
+
+            # Store device ID
+            if device_id:
+                archive_data["deviceIds"] = [device_id]
+
+            archive_ref.set(archive_data)
             print(f"📦 Created archive for {email_normalized}: credits={credits}, hasUsedTrial={has_used_trial}")
+
+        # If user had used trial, also block their device
+        if has_used_trial and device_id:
+            db.collection('trial_blocked_devices').document(device_id).set({
+                "blocked": True,
+                "blockedAt": firestore.SERVER_TIMESTAMP,
+                "blockedByEmail": email_normalized,
+                "blockedReason": "account_deletion_with_trial",
+            }, merge=True)
+            print(f"🚫 Blocked device {device_id} due to account deletion with trial history")
 
         return {
             "success": True,
@@ -850,6 +915,9 @@ async def check_deleted_account(
     Check if user's email has a deleted account with credits/trial history.
     Called after account creation to restore credits.
     AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+
+    IMPORTANT: This endpoint REPLACES the default 5 credits with archived credits,
+    NOT adds to them. This prevents credit duplication exploits.
     """
     # SECURITY: Verify Firebase ID token and get authenticated user ID
     authenticated_user_id = await verify_firebase_token(authorization)
@@ -865,6 +933,12 @@ async def check_deleted_account(
 
         user_data = user_doc.to_dict()
         email = user_data.get('email')
+        current_credits = user_data.get('credits', 0)
+
+        # Check if restoration already happened (prevent multiple restorations)
+        if user_data.get('restoredFromDeletedAccount'):
+            print(f"⚠️ User {authenticated_user_id} already restored from deleted account, skipping")
+            return {"success": True, "found": False, "message": "Already restored", "skipped": True}
 
         if not email:
             return {"success": True, "found": False, "message": "No email on account"}
@@ -883,36 +957,67 @@ async def check_deleted_account(
         archived_credits = archive_data.get('credits', 0)
         has_used_trial = archive_data.get('hasUsedTrial', False)
 
+        # CRITICAL: Check if archive was already restored (prevents credit duplication)
+        if archive_data.get('restoredToUid') and archive_data.get('credits', 0) == 0:
+            print(f"⚠️ Archive for {email_normalized} already restored, only setting trial flag")
+            # Only update the trial flag, don't give any credits
+            user_ref.update({
+                "hasUsedTrial": has_used_trial,
+                "restoredFromDeletedAccount": True,
+                "restoredAt": firestore.SERVER_TIMESTAMP,
+            })
+            return {
+                "success": True,
+                "found": True,
+                "restored": {"credits": 0, "hasUsedTrial": has_used_trial},
+                "message": "Trial flag restored, credits already claimed"
+            }
+
         print(f"📦 Found archived account for {email_normalized}: credits={archived_credits}, hasUsedTrial={has_used_trial}")
 
-        # Restore credits and set trial flag on current user
+        # CRITICAL FIX: Calculate the correct credit amount
+        # If user is a fresh account (has exactly 5 credits = default), replace with archived credits
+        # If user already has different credits, take the maximum (but don't stack)
+        # This prevents the +5 duplication exploit
+
+        if current_credits == 5:
+            # Fresh account - REPLACE the 5 default credits with archived credits
+            # User gets MAX(archived_credits, 5), not archived_credits + 5
+            final_credits = max(archived_credits, 5)
+            print(f"   Fresh account detected (5 credits). Setting to {final_credits} credits")
+        else:
+            # Not a fresh account (shouldn't happen normally, but handle gracefully)
+            # Take the higher of current or archived, don't add
+            final_credits = max(current_credits, archived_credits)
+            print(f"   Existing credits ({current_credits}). Setting to {final_credits} credits")
+
+        # Restore credits (SET, not INCREMENT) and set trial flag on current user
         update_data = {
+            "credits": final_credits,  # SET to final value, not INCREMENT
             "hasUsedTrial": has_used_trial,
             "restoredFromDeletedAccount": True,
             "restoredAt": firestore.SERVER_TIMESTAMP,
+            "previousArchivedCredits": archived_credits,  # For audit trail
         }
-
-        # Add credits if they had any
-        if archived_credits > 0:
-            # Use increment to add to any existing credits
-            update_data["credits"] = firestore.Increment(archived_credits)
 
         user_ref.update(update_data)
 
-        # Mark archive as restored (but keep the data for future reference)
+        # Mark archive as restored and zero out credits (prevents re-claiming)
         archive_ref.update({
             "restoredToUid": authenticated_user_id,
             "restoredAt": firestore.SERVER_TIMESTAMP,
-            "credits": 0,  # Zero out credits after restoration
+            "credits": 0,  # Zero out credits after restoration - CRITICAL
         })
 
-        print(f"✅ Restored {archived_credits} credits and trial flag for {email_normalized}")
+        credits_restored = final_credits - 5 if current_credits == 5 else 0
+        print(f"✅ Set credits to {final_credits} and trial flag for {email_normalized} (net change: {credits_restored})")
 
         return {
             "success": True,
             "found": True,
             "restored": {
-                "credits": archived_credits,
+                "credits": credits_restored,  # Report net credits added (can be negative)
+                "finalCredits": final_credits,
                 "hasUsedTrial": has_used_trial
             }
         }
@@ -1306,7 +1411,36 @@ async def paddle_webhook(
             # Mark trial usage to prevent future trial abuse
             if is_trialing:
                 update_data["hasUsedTrial"] = True
+                update_data["trialStartedAt"] = firestore.SERVER_TIMESTAMP
                 print(f"🏷️ Marking user {firebase_uid} as hasUsedTrial=True")
+
+                # Block the device ID if it was stored on the user
+                user_doc = user_ref.get()
+                if user_doc.exists:
+                    user_data = user_doc.to_dict()
+                    device_id = user_data.get('deviceId')
+                    user_email = user_data.get('email')
+
+                    if device_id:
+                        # Block this device from future trials
+                        db.collection('trial_blocked_devices').document(device_id).set({
+                            "blocked": True,
+                            "blockedAt": firestore.SERVER_TIMESTAMP,
+                            "blockedByUid": firebase_uid,
+                            "blockedByEmail": user_email,
+                            "subscriptionId": subscription_id,
+                        }, merge=True)
+                        print(f"🚫 Blocked device {device_id} from future trials")
+
+                    # Also update deleted_accounts if email exists
+                    if user_email:
+                        email_normalized = user_email.lower().strip()
+                        db.collection('deleted_accounts').document(email_normalized).set({
+                            "hasUsedTrial": True,
+                            "trialUsedAt": firestore.SERVER_TIMESTAMP,
+                            "email": email_normalized,
+                        }, merge=True)
+                        print(f"📧 Marked email {email_normalized} as trial used in deleted_accounts")
 
             # Add price_id if available
             if price_id:
@@ -1536,6 +1670,84 @@ async def paddle_webhook(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
+
+@app.post("/register-device")
+async def register_device(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Register a device ID with the current user.
+    Called on app launch to enable device-based trial prevention.
+    AUTHENTICATION REQUIRED: Include 'Authorization: Bearer <firebase_id_token>' header.
+    """
+    authenticated_user_id = await verify_firebase_token(authorization)
+
+    body = await request.json()
+    device_id = body.get('deviceId')
+
+    if not device_id:
+        raise HTTPException(status_code=400, detail="deviceId is required")
+
+    print(f"📱 Registering device {device_id} for user {authenticated_user_id}")
+
+    try:
+        user_ref = db.collection('users').document(authenticated_user_id)
+        user_doc = user_ref.get()
+
+        if not user_doc.exists:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_data = user_doc.to_dict()
+        email = user_data.get('email', '').lower().strip()
+
+        # Update user with device ID
+        user_ref.update({
+            "deviceId": device_id,
+            "deviceRegisteredAt": firestore.SERVER_TIMESTAMP,
+        })
+
+        # Check if this device is already blocked
+        device_doc = db.collection('trial_blocked_devices').document(device_id).get()
+        is_device_blocked = device_doc.exists and device_doc.to_dict().get('blocked', False)
+
+        # Check if email is blocked (from deleted accounts)
+        email_blocked = False
+        if email:
+            archive_doc = db.collection('deleted_accounts').document(email).get()
+            if archive_doc.exists:
+                email_blocked = archive_doc.to_dict().get('hasUsedTrial', False)
+
+        # If either is blocked, mark user as having used trial
+        if is_device_blocked or email_blocked:
+            user_ref.update({
+                "hasUsedTrial": True,
+            })
+            print(f"⚠️ User {authenticated_user_id} marked as trial-used (device_blocked={is_device_blocked}, email_blocked={email_blocked})")
+
+        # Also register this device with the email for cross-reference
+        db.collection('device_email_mappings').document(device_id).set({
+            "deviceId": device_id,
+            "emails": firestore.ArrayUnion([email]) if email else [],
+            "lastSeenUid": authenticated_user_id,
+            "lastSeenAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+
+        return {
+            "success": True,
+            "deviceId": device_id,
+            "trialBlocked": is_device_blocked or email_blocked,
+            "blockReason": "device" if is_device_blocked else ("email" if email_blocked else None)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error registering device: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
