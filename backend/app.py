@@ -1762,6 +1762,54 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.post("/admin/cleanup-auth")
+async def cleanup_auth(request: Request):
+    """
+    TEMPORARY: Delete all Firebase Auth users for testing.
+    Requires admin secret key.
+    """
+    body = await request.json()
+    admin_key = body.get('adminKey')
+
+    # Simple protection - require a key
+    expected_key = os.environ.get("ADMIN_CLEANUP_KEY", "dreamai-cleanup-2024")
+    if admin_key != expected_key:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    try:
+        deleted_users = []
+
+        # List and delete all users
+        page = firebase_auth.list_users()
+        while page:
+            for user in page.users:
+                try:
+                    firebase_auth.delete_user(user.uid)
+                    deleted_users.append({
+                        "uid": user.uid,
+                        "email": user.email,
+                    })
+                    print(f"🗑️ Deleted user: {user.email or user.uid}")
+                except Exception as e:
+                    print(f"❌ Error deleting {user.uid}: {e}")
+
+            page = page.get_next_page()
+
+        print(f"✅ Deleted {len(deleted_users)} users from Firebase Auth")
+
+        return {
+            "success": True,
+            "deleted_count": len(deleted_users),
+            "deleted_users": deleted_users
+        }
+
+    except Exception as e:
+        print(f"❌ Error in cleanup: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Optionally run with `python server.py` for local dev
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
